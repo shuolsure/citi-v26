@@ -55,7 +55,7 @@ const HEAT_COLORS = ['#EDECEA', '#E4F0CF', '#CFE8A8', '#B6DE86', '#8FBF6A'];
 const BADGES = [
   { key: 'streak7', name: '七日连续', icon: 'M12 3c3 4 5 6 5 9a5 5 0 0 1 -10 0c0 -1.5 .8 -2.8 2 -4c.4 1.4 1.2 2 2 2c-1 -3 0 -5.5 1 -7z', cond: '连续打卡 7 天' },
   { key: 'words100', name: '百词入库', icon: 'M5 4h11a2 2 0 0 1 2 2v14H7a2 2 0 0 1 -2 -2zM9 8h6', cond: '词库累计记下 100 词' },
-  { key: 'night10', name: '夜读人', icon: 'M18 14a7 7 0 0 1 -9 -9a7.5 7.5 0 1 0 9 9z', cond: '22 点后阅读满 10 次' },
+  { key: 'night10', name: '夜读人', icon: 'M18 14a7 7 0 0 1 -9 -9a7.5 7.5 0 1 0 9 9z', cond: '22 点到凌晨 4 点阅读满 10 天' },
   { key: 'book1', name: '读完一本', icon: 'M5 12.5l4.5 4.5L19 7', cond: '完整读完一本书' },
   { key: 'words1000', name: '千词屋', icon: 'M12 3l2.5 5.5l6 .8l-4.4 4.2l1.1 5.9l-5.2 -2.9l-5.2 2.9l1.1 -5.9l-4.4 -4.2l6 -.8z', cond: '词库累计记下 1000 词' },
   { key: 'month', name: '全勤一月', icon: 'M4 6h16v14H4zM4 10h16M8 3v4M16 3v4', cond: '一个自然月天天打卡' }
@@ -138,14 +138,19 @@ class App {
     const now = this.now();
     return (this.memo.models = Object.keys(this.data.entries).filter(w => this.entry(w)).map(w => F.modelEntry(w, this.data.entries[w], this.data.muted[w], now)));
   }
-  queue() { return this.memo.queue || (this.memo.queue = M.buildQueue(this.activeModels(), 0)); }
-  retNow(w) { const m = this.modelOf(w); return m ? M.retentionNow(m, 0) : 0; }
+  /** 模型参数：远程配置缓存 → 本地默认（R1 · 01 A8）。所有 M.* 调用都必须带它 */
+  cfg() { return this.memo.cfg || (this.memo.cfg = F.modelConfigOf(this.data.remote && this.data.remote.modelConfig)); }
+  queue() { return this.memo.queue || (this.memo.queue = M.buildQueue(this.activeModels(), 0, this.cfg())); }
+  retNow(w) { const m = this.modelOf(w); return m ? M.retentionNow(m, 0, this.cfg()) : 0; }
+  tier(w) { const m = this.modelOf(w); return m ? F.tierOf(m, this.cfg()) : null; }
 
   learnWord(w, ctx) {
     const today = this.today();
     const d = this.data;
     const prev = d.entries[w];
-    if (prev && !prev.deletedAt) return false;
+    const kind = F.learnKind(prev, this.now());
+    if (kind === 'active') return false;
+    if (kind === 'undo') { prev.deletedAt = null; this.save(); return true; }       // 24 小时内：撤销取消，原 firstAt / 复习史 / 出处都不动，新词数不加
     d.entries[w] = { firstAt: new Date().toISOString(), src: ctx.src || null, srcSentence: clip200(ctx.sentence), srcExpr: ctx.expr || null, reviews: prev ? prev.reviews : [], deletedAt: null };
     d.dailies[today] = d.dailies[today] || { mins: 0, newWords: 0 };
     d.dailies[today].newWords++;
@@ -400,7 +405,8 @@ class App {
     // ---------- 预测（近 28 天日均记词） ----------
     const learnedAt = Object.keys(d.entries).filter(w => this.entry(w) && deck.words.has(w)).map(w => Date.parse(d.entries[w].firstAt));
     const rate = F.dailyRate(d.dailies, today);
-    const f = F.forecast({ total: deck.total, learnedN, learnedAt, daily: rate, nowMs: now });
+    const tooNew = F.usedDaysOf(d.dailies, today) < F.FORECAST_MIN_DAYS;
+    const f = F.forecast({ total: deck.total, learnedN, learnedAt, daily: rate, nowMs: now, tooNew });
     const daily = rate >= 1 ? Math.round(rate) : rate > 0 ? rate.toFixed(1) : 0;
     const last3 = [2, 1, 0].map(k => { const x = F.addDays(today, -k); return { label: k === 0 ? '今天' : k === 1 ? '昨天' : '前天', n: (d.dailies[x] || {}).newWords || 0 }; });
     const max3 = Math.max(1, ...last3.map(x => x.n));
@@ -415,8 +421,8 @@ class App {
       const MIX = [16, 34, 54, 76, 100];
       const maxF = top.length ? top[0][1] : 1;
       const bars = top.map(([w, n]) => {
-        const r = this.entry(w) ? this.retNow(w) : 0;
-        const lv = !this.entry(w) ? 0 : r >= 0.85 ? 4 : r >= 0.8 ? 3 : 2;
+        const tr = this.tier(w);                                           // 与看板留存构成同一口径（R1 · 01 A4 D5）
+        const lv = !tr ? 0 : tr === 'solid' ? 4 : tr === 'ok' ? 3 : 2;
         return { h: Math.max(4, Math.round(n / maxF * 74)) + 'px', c: 'color-mix(in oklab,' + b.tone + ' ' + MIX[lv] + '%,#FFFFFF)' };
       });
       const pctB = this.bookPct(b);
@@ -432,7 +438,8 @@ class App {
       isRead: s.tab === 'read', isVocab: s.tab === 'vocab', isMe: s.tab === 'me', isReader: reader,
       deckName: deck.name, deckShort: deck.short, deckTotal: deck.total, learnedN, unlearnedN: deck.total - learnedN, tugW: tugPct + '%', tugPct,
       cycleDeck: () => this.cycleDeck(),
-      daily, dailyBasis: '按近 28 天速度', weeksLeft: f.weeks, doneDate: f.doneDate, doneDateShort: f.doneDateShort,
+      daily, dailyBasis: tooNew ? '用满 7 天后按近 28 天速度算' : '按近 28 天速度', weeksLeft: f.weeks, doneDate: f.doneDate, doneDateShort: f.doneDateShort,
+      doneLineShort: f.daysLeft && f.daysLeft <= 365 ? '预计 ' + f.doneDate + ' 学完' : f.doneDate + ' 学完',
       pastPath: f.pastPath, futurePath: f.futurePath, areaPath: f.areaPath, nowX: f.nowX.toFixed(1), nowY: f.nowY.toFixed(1), endX: f.endX.toFixed(1), endY: f.endY.toFixed(1),
       nowLabelX: f.nowLabelX, yTop: f.yTop, yMid: f.yMid,
       last3: last3.map(x => ({ ...x, h: Math.max(3, Math.round(x.n / max3 * 26)) + 'px' })),
@@ -447,7 +454,7 @@ class App {
       pct: curBook ? this.bookPct(curBook) : 0,
       bookDash: (2 * Math.PI * 21 * (curBook ? this.bookPct(curBook) : 0) / 100).toFixed(1) + ' ' + (2 * Math.PI * 21).toFixed(1),
       openBook: () => curBook ? this.openBook(curBook.id) : this.setState({ imp: 1 }),
-      dueCount: due.length,
+      dueCount: due.length, hasDue: due.length > 0,
       goRead: () => this.go('read'), goVocab: () => this.go('vocab'), goMe: () => this.go('me'),
       backToRead: () => this.leaveReader('read'),
       closeAll: () => this.setState({ sheet: null, settings: false, chapters: false, log: null, imp: s.imp === 2 ? 2 : 0, badge: null, share: false, sheetBook: null, fb: null, bkMenu: null, renaming: null, ask: null }),
@@ -734,7 +741,7 @@ class App {
       const tones = ['#030315', '#8CC152', 'rgba(122,122,133,.34)'];
       const cnt = [0, 0, 0];
       const maxF = top.length ? top[0][1] : 1;
-      const bars = top.map(([w2, n]) => { const g = !this.entry(w2) ? 2 : this.retNow(w2) >= 0.85 ? 0 : 1; cnt[g]++; return { h: Math.max(5, Math.round(n / maxF * 100)) + '%', c: tones[g] }; });
+      const bars = top.map(([w2, n]) => { const tr = this.tier(w2), g = !tr ? 2 : tr === 'solid' ? 0 : 1; cnt[g]++; return { h: Math.max(5, Math.round(n / maxF * 100)) + '%', c: tones[g] }; });
       const pb = this.bookPct(bk);
       Object.assign(out, {
         bkTitle: bk.title, bkRead: pb === 0 ? '还没开始' : '已读 ' + pb + '%',
@@ -744,7 +751,7 @@ class App {
             ring: on ? 'inset 0 0 0 1.5px var(--ink2)' : 'inset 0 0 0 1px rgba(122,122,133,.22)', weight: on ? 600 : 400,
             onClick: () => { d.prefs.bookDecks[bk.hash] = x.id; this.save(); } };
         }),
-        bkBars: bars, bkLegend: ['已掌握', '学习中', '未学'].map((nm, g) => ({ name: nm, n: cnt[g], c: tones[g] }))
+        bkBars: bars, bkLegend: ['牢固', '学习中', '未学'].map((nm, g) => ({ name: nm, n: cnt[g], c: tones[g] }))
       });
     } else Object.assign(out, { bkTitle: '', bkRead: '', bkDecks: [], bkBars: [], bkLegend: [] });
     Object.assign(out, { bkY: bk ? '0%' : '118%', bkOpen: () => { const id = s.sheetBook; this.setState({ sheetBook: null }); this.openBook(id); }, bkClose: () => this.setState({ sheetBook: null }) });
@@ -799,7 +806,7 @@ class App {
     else pool = learnedWords.concat([...deck.words].filter(w => !this.entry(w)));
     const retMemo = new Map(), dueMemo = new Map();
     const ret = w => { if (!retMemo.has(w)) retMemo.set(w, this.entry(w) ? this.retNow(w) : 1); return retMemo.get(w); };
-    const nextOf = w => { if (!dueMemo.has(w)) { const m = this.modelOf(w); dueMemo.set(w, m ? M.nextDue(M.buildHistory(m), 0) : 9999); } return dueMemo.get(w); };
+    const nextOf = w => { if (!dueMemo.has(w)) { const m = this.modelOf(w); dueMemo.set(w, m ? M.nextDue(M.buildHistory(m, this.cfg()), 0, this.cfg()) : 9999); } return dueMemo.get(w); };
     let list = pool.filter(w => this.dict.words.has(w)).filter(w => !qq || w.toLowerCase().includes(qq) || (this.dict.words.get(w).def || '').includes(s.q.trim()));
     const firstAt = w => this.entry(w) ? Date.parse(d.entries[w].firstAt) : 0;
     if (s.sortIdx === 1) list.sort((a, b) => nextOf(a) - nextOf(b));
@@ -809,12 +816,11 @@ class App {
     list = list.slice(0, s.vocabLimit);
     const vocabList = list.map(w => {
       const dw = this.dict.words.get(w), m = this.modelOf(w), has = !!m;
-      const h = has ? M.buildHistory(m) : null;
-      const c = has ? F.ebbChart(h, 158, 54, 2, 4, 4, 3) : null;
-      const nextIn = has ? Math.round(c.nextAt) : 0;
+      const h = has ? M.buildHistory(m, this.cfg()) : null;
+      const c = has ? F.ebbChart(h, 158, 54, 2, 4, 4, 3, this.cfg()) : null;
       return { key: w, w, def: dw.def, has, blank: !has, mini: has ? c.past : '', area: has ? c.area : '', future: has ? c.future : '', dots: has ? c.dots : [],
         nowX: has ? c.nowX : 0, nowY: has ? c.nowY : 0, thrY: has ? c.thrY : 40, baseY: has ? c.baseY : 50,
-        pct: has ? Math.round(M.retentionNow(m, 0) * 100) + '%' : '', caption: has ? (nextIn <= 0 ? '今日复习最佳' : nextIn + ' 日后复习最佳') : '还没记下这个词',
+        pct: has ? Math.round(M.retentionNow(m, 0, this.cfg()) * 100) + '%' : '', caption: has ? F.dueCaption(c.nextAt) : '还没记下这个词',
         onClick: () => this.setState({ log: w }) };
     });
     const out = {
@@ -834,9 +840,9 @@ class App {
     let lv = { logWord: '', logDef: '', logPh: '', logStrength: 0, logNext: '', logPast: '', logFuture: '', logArea: '', logDots: [], logs: [], logLine: 66, logNowX: 0, logNowY: 0 };
     if (lw) {
       const dw = this.dict.words.get(lw) || {}, m = this.modelOf(lw), has = !!m;
-      const h = has ? M.buildHistory(m) : null;
-      const c = has ? F.ebbChart(h, 336, 112, 10, 12, 24, 99) : null;
-      const strength = has ? Math.round(M.retentionNow(m, 0) * 100) : 0;
+      const h = has ? M.buildHistory(m, this.cfg()) : null;
+      const c = has ? F.ebbChart(h, 336, 112, 10, 12, 24, 99, this.cfg()) : null;
+      const strength = has ? Math.round(M.retentionNow(m, 0, this.cfg()) * 100) : 0;
       const e = d.entries[lw];
       const revs = has ? F.reviewsOf(e) : [];
       const GR = { keep: '记得', fuzzy: '模糊', forget: '忘了' };
@@ -880,7 +886,7 @@ class App {
     const timeBars = minsList.map((m, i) => ({ h: Math.max(4, Math.round(m / peakMin * 56)) + 'px', c: i === dow ? 'var(--bar)' : m > 0 ? '#8FBF6A' : 'var(--line)', label: WEEK_LABELS[i], w: i === dow ? 600 : 400 }));
     const weekMins = minsList.reduce((a, b) => a + b, 0);
     // 单词学习榜
-    const rOf = new Map(models.map(m => [m.w, M.retentionNow(m, 0)]));
+    const rOf = new Map(models.map(m => [m.w, M.retentionNow(m, 0, this.cfg())]));
     const wordTop = models.map(m => ({ w: m.w, n: m.reviews.length + 1, r: rOf.get(m.w) })).sort((a, b) => b.n - a.n || b.r - a.r).slice(0, 5)
       .map((v, i) => ({ rank: i + 1, w: v.w, rankColor: i === 0 ? 'var(--ink2)' : 'var(--sub2)', barW: Math.round(v.r * 100) + '%', pct: Math.round(v.r * 100) + '%' }));
     // 书籍排行榜
@@ -888,7 +894,7 @@ class App {
     const bookTop = bookRows.map((b, i, arr) => ({ rank: i + 1, title: b.title, cover: 'linear-gradient(162deg,' + b.tone + ',color-mix(in oklab,' + b.tone + ' 44%,#14161A))',
       rankColor: i === 0 ? 'var(--ink2)' : 'var(--sub2)', barW: Math.round(b.secs / arr[0].secs * 100) + '%', hours: (b.secs / 3600).toFixed(1) + ' h' }));
     // 留存构成
-    const br = M.retentionBreakdown(models, 0);
+    const br = M.retentionBreakdown(models, 0, this.cfg());
     const totalR = Math.max(1, br.solid + br.ok + br.due);
     const RC2 = 2 * Math.PI * 26;
     const seg = n => (RC2 * n / totalR).toFixed(1) + ' ' + RC2.toFixed(1);
@@ -921,17 +927,17 @@ class App {
     const yearSlots = [];
     for (let i = 0; i < P.yearGoal; i++) yearSlots.push({ c: i < yearDone ? 'var(--bar)' : 'var(--line)' });
     // 记忆曲线：该词库的理想排程示意（模型理想节奏，不是用户数据）
-    const ideal = M.idealSchedule(5);
+    const ideal = M.idealSchedule(5, this.cfg());
     const shift = ideal.revs[4] + 6;
     const ebbM = { revs: ideal.revs.map(x => x - shift), P: ideal.P, S: ideal.S, n: ideal.n };
-    const ebbC = F.ebbChart(ebbM, 302, 96, 6, 10, 14, 99);
+    const ebbC = F.ebbChart(ebbM, 302, 96, 6, 10, 14, 99, this.cfg());
     const ebbPeaks = ebbM.revs.map((r, i) => ({ cx: ebbC.dots[i].cx, cy: ebbC.dots[i].cy, label: i === 0 ? '初记' : '+' + Math.round(r - ebbM.revs[i - 1]) + '天', pct: Math.round(ebbM.P[i] * 100) + '%' }));
     const avgRet = models.length ? Math.round(models.reduce((a, m) => a + rOf.get(m.w), 0) / models.length * 100) : 0;
     // 勋章
     const bf = F.badgeFacts(d, today);
     const badges = BADGES.map((b, i) => { const got = !!d.badges[b.key];
       return { name: b.name, icon: b.icon, got, onClick: () => this.setState({ badge: i }), bg: got ? LIME : 'var(--mute)', fg: got ? '#030315' : 'var(--sub2)', ring: got ? 'none' : 'inset 0 0 0 1px rgba(3,3,21,.07)', labelColor: got ? 'var(--ink2)' : 'var(--sub2)' }; });
-    const PROG = { streak7: `连续 ${bf.streak} / 7 天`, words100: `${bf.words} / 100 词`, night10: `${bf.nightDays} / 10 次`, book1: `${bf.finishedBooks} / 1 本`, words1000: `${bf.words} / 1000 词`, month: `本月已打卡 ${bf.monthDays} 天` };
+    const PROG = { streak7: `连续 ${bf.streak} / 7 天`, words100: `${bf.words} / 100 词`, night10: `${bf.nightDays} / 10 天`, book1: `${bf.finishedBooks} / 1 本`, words1000: `${bf.words} / 1000 词`, month: `本月已打卡 ${bf.monthDays} 天` };
     const bi = s.badge;
     const TINT = { card: '#FFFFFF', mute: '#F2F1F0', sub: '#41513F', sub2: '#6E7583', line: 'rgba(3,3,21,.08)', btn: '#030315', btnFg: '#FFFFFF', bar: '#030315', ink: '#030315' };
     // 不能写 var(--card)：卡片上 --card:var(--card) 是自引用循环，整张卡里的变量全部失效（原型数据就有这个坑）
@@ -987,8 +993,9 @@ class App {
 
   // ---------- 复习 ----------
   openReview(queue) {
-    const q = queue || [...new Set(this.queue().concat(this.s.forced.filter(w => this.entry(w))))];
-    if (!q.length) { this.flash('今天没有到期的词'); return; }
+    const all = queue || [...new Set(this.queue().concat(this.s.forced.filter(w => this.entry(w))))];
+    if (!all.length) { this.flash('今天没有到期的词'); return; }
+    const q = all.slice(0, F.ROUND_MAX);                                   // 每轮最多 30 词（R1 · 01 A7）
     this.setState({ tab: 'review', rv: { queue: q, i: 0, revealed: false, res: [] }, sheet: null, settings: false, chapters: false, log: null, forced: [], spellVal: '', choicePick: null });
   }
   valsReview() {
@@ -999,14 +1006,15 @@ class App {
     const cur = curW ? this.entry(curW) : null;
     const dw = curW ? (this.dict.words.get(curW) || {}) : {};
     const m = curW && cur ? this.modelOf(curW) : null;
-    const gr = g => m ? M.previewGrade(m, g, 0) : { days: 0, peak: 0 };
+    const gr = g => m ? M.previewGrade(m, g, 0, this.cfg()) : { days: 0, peak: 0 };
     const hasCtx = !!(cur && cur.srcSentence && cur.srcExpr && cur.srcSentence.includes(cur.srcExpr));
     const mode = P.rvMode === 'context' && !hasCtx ? 'recall' : P.rvMode;          // 缺原文降级为回想中文（PRD §7）
     const asking = !!(rv && !rvSummary && !rv.revealed);
     const applyGrade = g => {
       if (!cur) return;
-      const before = M.retentionNow(m, 0);
-      const pv = M.previewGrade(m, g, 0);
+      if (g === 'keep' && !keepOk) return;                                   // 答错「记得」不可选（R1 · 01 A6 · 拍板 Q4）
+      const before = M.retentionNow(m, 0, this.cfg());
+      const pv = M.previewGrade(m, g, 0, this.cfg());
       cur.reviews = (cur.reviews || []).concat([{ at: new Date().toISOString(), grade: g, mode }]);
       this.save();
       this.setState({ rv: { ...rv, i: rv.i + 1, revealed: false, res: rv.res.concat([{ w: curW, g, days: pv.days, p: pv.peak, before }]) }, spellVal: '', choicePick: null });
@@ -1024,6 +1032,7 @@ class App {
       choiceDefs.push(...picks);
     }
     const choiceOk = s.choicePick !== null && choiceDefs[s.choicePick] === dw.def;
+    const keepOk = F.keepAllowed(mode, spellOk, choiceOk);
     const ctxRuns = [];
     if (hasCtx) {
       const parts = cur.srcSentence.split(cur.srcExpr);
@@ -1039,9 +1048,12 @@ class App {
     return {
       rvOn: s.tab === 'review', rvSummary, rvIdx: rv ? Math.min(rv.i + 1, rvTotal) : 0, rvTotal, rvProgW: rvTotal ? Math.round(rv.i / rvTotal * 100) + '%' : '0%',
       rvWord: curW || '', rvPh: dw.ph || '', rvDef: dw.def || '', rvPos: dw.pos || '', rvEx: exLine, rvExZh: dw.ex ? dw.exZh : (cur && cur.srcSentence ? '记下时的原文' + (cur.src ? ' · ' + cur.src : '') : ''),
-      rvRet: m ? Math.round(M.retentionNow(m, 0) * 100) + '%' : '', rvRevealed: !!(rv && !rvSummary && rv.revealed), rvHidden: asking,
+      rvRet: m ? Math.round(M.retentionNow(m, 0, this.cfg()) * 100) + '%' : '', rvRevealed: !!(rv && !rvSummary && rv.revealed), rvHidden: asking,
       rvReveal: () => this.setState({ rv: { ...rv, revealed: true } }),
       rvKeepDays: gr('keep').days, rvFuzzyDays: gr('fuzzy').days, rvForgetDays: gr('forget').days,
+      rvKeepLabel: keepOk ? F.keepLabel(gr('keep').days) : '这次不能选', rvFuzzyLabel: F.keepLabel(gr('fuzzy').days), rvForgetLabel: F.keepLabel(gr('forget').days),
+      rvKeepBg: keepOk ? '#BFE699' : 'rgba(191,230,153,.32)', rvKeepFg: keepOk ? '#030315' : 'var(--sub2)',   // 置灰：同色系淡化，仍看得出是「记得」那颗按钮 rvKeepCursor: keepOk ? 'pointer' : 'default',
+      rvAgainLabel: rvSummary && this.queue().length ? '还有 ' + this.queue().length + ' 个到期词，再练一轮' : '再练一轮',
       gradeKeep: () => applyGrade('keep'), gradeFuzzy: () => applyGrade('fuzzy'), gradeForget: () => applyGrade('forget'),
       rvExit: () => this.setState({ tab: 'me', rv: null }),
       rvDots: rv ? rv.queue.map((w, i) => ({ key: i, c: i < rv.i ? LIME : i === rv.i ? 'var(--ink2)' : 'rgba(122,122,133,.28)', wd: i === rv.i ? '18px' : '6px' })) : [],
@@ -1054,7 +1066,8 @@ class App {
       openReview: () => this.openReview(),
       rvModes: RV_MODES.map(x => ({ name: x.name, hint: x.hint, dot: P.rvMode === x.k ? LIME : 'transparent', dotRing: P.rvMode === x.k ? 'none' : 'inset 0 0 0 1.5px rgba(122,122,133,.4)', onClick: () => { P.rvMode = x.k; this.save(); this.flash('复习方式 · ' + x.name); } })),
       rvAskRecall: asking && mode === 'recall', rvAskSpell: asking && mode === 'spell', rvAskChoice: asking && mode === 'choice', rvAskContext: asking && mode === 'context',
-      rvZh: dw.zh || '', rvSrc: cur && cur.src ? cur.src : '', rvHintLen: curW ? curW.length + ' 个字母' : '',
+      // rvZh 只出现在拼写题：给读到的那个中文表达，没有才用词典释义（R1 · 01 A14）
+      rvZh: (cur && cur.srcExpr) || dw.zh || '', rvSrc: cur && cur.src ? cur.src : '', rvHintLen: curW ? curW.length + ' 个字母' : '',
       rvExBlank: dw.ex ? dw.ex.split(curW).join('______') : (srcFull ? srcFull : '（这个词还没有例句）'),
       rvCtx: ctxRuns, spellVal: s.spellVal, onSpell: e => this.setState({ spellVal: e.target.value }),
       rvChoices: choiceDefs.map((def, i) => { const on = s.choicePick === i; return { key: i, def, tag: 'ABCD'[i], bg: on ? '#BFE699' : 'var(--card)', ring: on ? 'none' : 'var(--cardSh)', tagBg: on ? 'rgba(3,3,21,.12)' : 'var(--mute)', tagFg: on ? '#030315' : 'var(--sub)', onClick: () => this.setState({ choicePick: i, rv: { ...rv, revealed: true } }) }; }),

@@ -16,6 +16,42 @@ export function modelEntry(w, e, muted, nowMs) {
 }
 export function isDemoted(e) { const r = reviewsOf(e); return r.length > 0 && r[r.length - 1].grade === 'forget'; }
 
+// ---------- 模型参数（R1 · 01 A8）：远程配置缓存 → 本地默认；远程只带改动的键 ----------
+export function modelConfigOf(remote) {
+  return remote ? { ...M.DEFAULT_CONFIG, ...remote, GRADES: { ...M.DEFAULT_CONFIG.GRADES, ...(remote.GRADES || {}) } } : M.DEFAULT_CONFIG;
+}
+/** 三档口径（与 retentionBreakdown 同一条规则）：'due' 到期 / 'solid' 未到期且 S ≥ SOLID_S / 'ok' 其余 */
+export function tierOf(e, cfg = M.DEFAULT_CONFIG, now = 0) {
+  const m = M.truncateToNow(M.buildHistory(e, cfg), now);
+  if (M.retentionAt(m, now) < cfg.DUE_AT) return 'due';
+  return m.S[m.n - 1] >= cfg.SOLID_S ? 'solid' : 'ok';
+}
+
+// ---------- 记下 / 取消（R1 · 01 A10 · 拍板 Q5）：取消后 24 小时内再记下 = 撤销取消（与服务端 learn.mjs 同口径） ----------
+export const UNDO_WINDOW_MS = 24 * 3600e3;
+/** 'active' 已在词库 · 'undo' 撤销取消（原 firstAt 与复习史接着用，新词数不加）· 'new' 新记下 */
+export function learnKind(prev, nowMs) {
+  if (prev && !prev.deletedAt) return 'active';
+  if (prev && nowMs - Date.parse(prev.deletedAt) <= UNDO_WINDOW_MS) return 'undo';
+  return 'new';
+}
+
+// ---------- 复习（R1 · 01 A2 A6 A7） ----------
+export const ROUND_MAX = 30;
+/** 词库列表副标题：到期了才说「今日」，不足 1 天说小时，其余天数与按钮同一取整（Math.round） */
+export function dueCaption(nextAt) {
+  if (nextAt <= 0) return '今日复习最佳';
+  if (nextAt < 0.5) return Math.ceil(nextAt * 24) + ' 小时后复习最佳';
+  return Math.round(nextAt) + ' 日后复习最佳';
+}                                  // 每轮最多 30 词，超出的进下一轮（队列已按留存升序）
+export const keepLabel = days => days >= 1 ? '下次 +' + days + ' 天' : '今天再来';
+/** 拼写 / 四选一答错（含没作答）时「记得」不可选；回想 / 回到原文没有客观对错 */
+export function keepAllowed(mode, spellOk, choiceOk) {
+  if (mode === 'spell') return spellOk;
+  if (mode === 'choice') return choiceOk;
+  return true;
+}
+
 // ---------- 打卡 ----------
 /** 从今天往前数连续 mins>0；今天没读从昨天起算（docs/00 §0） */
 export function streakOf(dailies, today) {
@@ -44,10 +80,19 @@ export function fullMonthAttended(dailies, today) {
 
 // ---------- 勋章（阈值与服务端 stats.mjs 同一组，Q5 推荐值） ----------
 export const BADGE_T = { streak7: 7, words100: 100, night10: 10, nightHour: 22, book1: 1, words1000: 1000 };
+// 夜读 = 22:00–03:59，凌晨归前一天（R1 · 01 D12；服务端 stats.mjs nightDayOf 同口径）
+export const NIGHT_END_HOUR = 4;
+export function nightDayOf(date, hour, startHour = BADGE_T.nightHour) {
+  if (hour >= startHour) return date;
+  if (hour < NIGHT_END_HOUR) return addDays(date, -1);
+  return null;
+}
 export const BADGE_KEYS = ['streak7', 'words100', 'night10', 'book1', 'words1000', 'month'];
 export function badgeFacts(data, today) {
   const words = Object.values(data.entries).filter(activeEntry).length;
-  const nightDays = Object.values(data.hours).filter(h => h.slice(BADGE_T.nightHour).some(s => s > 0)).length;
+  const nights = new Set();
+  for (const [date, h] of Object.entries(data.hours)) h.forEach((s, hour) => { const n = s > 0 ? nightDayOf(date, hour) : null; if (n) nights.add(n); });
+  const nightDays = nights.size;
   const finishedBooks = data.books.filter(b => b.finishedAt).length;
   const monthKey = today.slice(0, 7);
   const monthDays = Object.keys(data.dailies).filter(d => d.startsWith(monthKey) && data.dailies[d].mins > 0).length;
@@ -65,13 +110,23 @@ export function judgeBadges(f) {
 }
 
 // ---------- 学习预测（PRD C3：近 28 天日均记词） ----------
+// R1 · 01 D13：分母 min(28, 使用天数)，使用不足 7 天不外推
+export const FORECAST_MIN_DAYS = 7;
+/** 使用天数 = 最早一条有阅读或记词的日子到今天（含今天） */
+export function usedDaysOf(dailies, today) {
+  const first = Object.keys(dailies).filter(d => d <= today && ((dailies[d].mins || 0) > 0 || (dailies[d].newWords || 0) > 0)).sort()[0];
+  if (!first) return 0;
+  return Math.round((Date.parse(today + 'T12:00:00') - Date.parse(first + 'T12:00:00')) / DAY) + 1;
+}
 export function dailyRate(dailies, today) {
+  const used = usedDaysOf(dailies, today);
+  if (used < FORECAST_MIN_DAYS) return 0;
   let sum = 0;
   for (let i = 0; i < 28; i++) { const d = dailies[addDays(today, -i)]; if (d) sum += d.newWords || 0; }
-  return sum / 28;
+  return sum / Math.min(28, used);
 }
 /** 过去 4 周末的累计已学（按 firstAt 事实数）+ 按 daily 外推；daily=0 时 daysLeft=null */
-export function forecast({ total, learnedN, learnedAt, daily, nowMs }) {
+export function forecast({ total, learnedN, learnedAt, daily, nowMs, tooNew = false }) {
   const past = [21, 14, 7, 0].map(k => k === 0 ? learnedN : learnedAt.filter(t => t <= nowMs - k * DAY).length);
   const remaining = Math.max(0, total - learnedN);
   const daysLeft = daily > 0 ? Math.max(1, Math.ceil(remaining / daily)) : null;
@@ -92,7 +147,7 @@ export function forecast({ total, learnedN, learnedAt, daily, nowMs }) {
     pastPath: d(pastPts), futurePath: daily > 0 ? d(futurePts) : '', areaPath: d(pastPts) + ' L' + x(3).toFixed(1) + ' ' + BOT + ' L' + L + ' ' + BOT + ' Z',
     nowX: x(3), nowY: y(learnedN), endX: daily > 0 ? end[0] : x(3), endY: daily > 0 ? end[1] : y(learnedN),
     nowLabelX: (x(3) - 14).toFixed(0) + 'px', yTop: TOP, yMid: (TOP + BOT) / 2, daysLeft, weeks,
-    doneDate: date ? (daysLeft > 365 ? '按现在的速度要约 ' + Math.round(daysLeft / 365) + ' 年才能' : fmtMD(date)) : (remaining === 0 ? '已经' : '多记几个词，才算得出哪天'),
+    doneDate: date ? (daysLeft > 365 ? '按现在的速度要约 ' + Math.round(daysLeft / 365) + ' 年才能' : fmtMD(date)) : (remaining === 0 ? '已经' : tooNew ? '多用几天，才算得出哪天' : '多记几个词，才算得出哪天'),
     doneDateShort: date ? (date.getMonth() + 1) + '/' + date.getDate() : '—'
   };
 }

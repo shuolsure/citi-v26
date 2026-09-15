@@ -31,6 +31,7 @@ export function freshState() {
     books: [],                  // 书架（元信息，不含正文）
     pendingBooks: [],           // 从备份恢复、但本机还没有正文的书（按 hash 等重新导入时认领进度）
     backupAt: null,             // 上次导出备份的时间（本机，不进备份）
+    remote: null,               // 远程配置缓存 {modelConfig}（R1 穿透，R5 起由 /v1/config 填；网页版不连后端时为空 → 用本地默认）
     // 偏好（与服务端 Prefs 同名字段）
     prefs: { deckId: 'cet4', bookDecks: {}, goal: 90, board: ['heat', 'progress', 'time', 'badges'], rvMode: 'recall',
       remind: false, remindAt: '22:30', idle: 3, bgCount: false, outlier: true, sync: true, yearGoal: 12 },
