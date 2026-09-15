@@ -5,6 +5,8 @@
 //   · 一本书的所有章节一个事务写完，事务成功后才把书加进书架（半本书比没有书更坏）
 //   · 攒出来的数不存：连续天数、到期数、留存都现算；这里只存事实
 // 不能叫 'citi'：GitHub Pages 上旧版 citi-app 与本应用同源（shuolsure.github.io），它已占用同名库且结构不同
+import { STATE_V, migrate } from './backup.js';
+
 const DB_NAME = 'citi-v26';
 const DB_VER = 1;
 
@@ -13,7 +15,7 @@ function tx2p(t) { return new Promise((res, rej) => { t.oncomplete = () => res()
 
 export function freshState() {
   return {
-    v: 1,
+    v: STATE_V,                 // 本地结构版本；读取时缺省视为 1，升版走 backup.js 的 migrate()
     auth: null,                 // null=没选过 · 'guest'
     onboarded: false,
     quizEst: 0,
@@ -27,6 +29,8 @@ export function freshState() {
     badges: {},                 // key → gotAt
     customDecks: [],            // {id, name, words:[w], createdAt}
     books: [],                  // 书架（元信息，不含正文）
+    pendingBooks: [],           // 从备份恢复、但本机还没有正文的书（按 hash 等重新导入时认领进度）
+    backupAt: null,             // 上次导出备份的时间（本机，不进备份）
     // 偏好（与服务端 Prefs 同名字段）
     prefs: { deckId: 'cet4', bookDecks: {}, goal: 90, board: ['heat', 'progress', 'time', 'badges'], rvMode: 'recall',
       remind: false, remindAt: '22:30', idle: 3, bgCount: false, outlier: true, sync: true, yearGoal: 12 },
@@ -50,10 +54,11 @@ export async function openStore() {
   async function loadState() {
     const t = db.transaction('kv', 'readonly');
     const s = await req2p(t.objectStore('kv').get('state'));
-    ready = true;
-    if (!s) return freshState();
+    if (!s) { ready = true; return freshState(); }
     const base = freshState();
-    return { ...base, ...s, prefs: { ...base.prefs, ...(s.prefs || {}) }, local: { ...base.local, ...(s.local || {}) } };
+    const m = migrate(s);                                  // 比应用新的数据在这里抛，ready 保持 false：老应用不许写回
+    ready = true;
+    return { ...base, ...m, prefs: { ...base.prefs, ...(m.prefs || {}) }, local: { ...base.local, ...(m.local || {}) } };
   }
 
   async function saveState(state) {

@@ -6,6 +6,7 @@ import { mount } from './runtime.js';
 import { openStore } from './store.js';
 import { loadDict, parseAndMatch, matchChapter, ImportError } from './library.js';
 import * as F from './facts.js';
+import { exportBackup, validateBackup, applyBackup, claimPending, summarize } from './backup.js';
 
 // ---------- 设计常量（来自原型，纯展示） ----------
 const DEN_NAMES = ['极轻', '轻', '偏轻', '适中', '偏密', '密'];
@@ -73,7 +74,7 @@ class App {
       imp: 0, impSrc: '', impPct: 0, impPhase: '读取文件', impErr: null, impErrMsg: '', impResult: null, q: '', chQ: '', sortIdx: 0, filter: 0,
       page: null, badge: null, share: false, sheetBook: null, fb: null, fbReason: 0, bkMenu: null, renaming: null, renameVal: '', ask: null,
       quiz: [], spellVal: '', choicePick: null, ndName: '', ndSrc: 0, ndPaste: '', ndSel: [], chVis: 1, chSc: 0, chBarDrag: false, fsDrag: false,
-      toast: null, loading: true, netFail: false, rpage: 0, pageCount: 1, vocabLimit: 40, chPct: 0, reader: null, sessionLearned: 0, forced: []
+      toast: null, loading: true, netFail: false, rpage: 0, pageCount: 1, vocabLimit: 40, chPct: 0, reader: null, sessionLearned: 0, forced: [], bkPending: null, bkErr: ''
     };
     this.data = null; this.dict = null; this.idx = new Map(); this.memo = {};
   }
@@ -299,6 +300,12 @@ class App {
       finishedAt: existing ? existing.finishedAt : null, openedAt: new Date().toISOString(), tone: TONES[hashStr(r.hash) % TONES.length]
     };
     const idx = { freq: r.stats.freq, chWords: r.chapters.map(c => [...new Set(c.slots.map(s => s.w))]) };
+    // 从备份恢复过、但当时本机没有正文的书：同 hash 重新导入时接上进度（与书架写入同一事务）
+    const claimed = existing ? null : claimPending(this.data, meta);
+    if (claimed) {
+      Object.assign(meta, claimed.meta);
+      this.data = { ...this.data, pendingBooks: claimed.pendingBooks, bookSecs: { ...this.data.bookSecs, [id]: (this.data.bookSecs[id] || 0) + claimed.secs } };
+    }
     this.data = await this.store.putBook(this.data, meta, r.chapters, idx);
     this.idx.set(id, idx);
     const deck = this.bookDeck(meta);
@@ -306,6 +313,7 @@ class App {
     for (const c of r.chapters) for (const s of c.slots) if (deck.words.has(s.w) || this.entry(s.w)) { slots++; if (!this.entry(s.w)) fresh.add(s.w); }
     this.touch();
     this.setState({ imp: reparseId ? 0 : 3, impResult: { id, chapters: r.chapters.length, slots, fresh: fresh.size, chapter: meta.pos.chapter } });
+    if (claimed) this.flash('已接上备份里的进度 · 第 ' + (meta.pos.chapter + 1) + ' 章');
     if (reparseId) this.flash('已重新解析《' + meta.title + '》');
   }
   async addSample() {
@@ -961,7 +969,8 @@ class App {
         { icon: 'M4 4l16 16M10 5a7 7 0 0 1 9 7M5 12a7 7 0 0 0 9 7', label: '不再替换的词', value: mutedN + ' 个', onClick: () => this.setState({ page: 'muted' }) },
         { icon: 'M18 9a6 6 0 1 0 -12 0c0 4 -1.5 5 -2 6h16c-.5 -1 -2 -2 -2 -6M10 20a2.2 2.2 0 0 0 4 0', label: '每日提醒', value: P.remind ? P.remindAt : '已关闭', onClick: () => this.setState({ page: 'remind' }) },
         { icon: 'M12 4a8 8 0 1 0 0 16a8 8 0 0 0 0 -16M12 8v4l3 2', label: '时长统计口径', value: '无操作 ' + P.idle + ' 分钟', onClick: () => this.setState({ page: 'stat' }) },
-        { icon: 'M4 8h13l-3 -3M20 16H7l3 3', label: '看板同步', value: P.sync ? '随账号' : '仅本机', onClick: () => this.setState({ page: 'sync' }) }
+        { icon: 'M4 8h13l-3 -3M20 16H7l3 3', label: '看板同步', value: P.sync ? '随账号' : '仅本机', onClick: () => this.setState({ page: 'sync' }) },
+        { icon: 'M12 4v11M7.5 10.5L12 15l4.5 -4.5M5 19h14', label: '备份与恢复', value: d.backupAt ? '上次 ' + F.ymd(new Date(d.backupAt)).slice(5) : '未备份', onClick: () => this.setState({ page: 'backup', bkPending: null, bkErr: '' }) }
       ],
       startReview: () => this.openReview(),
       badgeY: bi !== null ? '0%' : '118%', badgeName: bi !== null ? BADGES[bi].name : '', badgeIcon: bi !== null ? BADGES[bi].icon : '',
@@ -1141,13 +1150,68 @@ class App {
   }
 
   // ---------- 设置二级页 ----------
+  // ============ 备份与恢复（R0 · 01 E2）============
+  valsBackup() {
+    const s = this.s, d = this.data, pd = s.bkPending;
+    const sm = pd ? summarize(pd, d.books) : null;
+    return {
+      isPageBackup: s.page === 'backup',
+      backupExport: () => this.exportBackupFile(), backupPick: () => this.pickBackupFile(),
+      backupExportSub: d.backupAt ? '上次导出 ' + F.ymd(new Date(d.backupAt)) : '还没导出过',   // 本地日期：ISO 是 UTC，凌晨导出会显示成前一天
+      backupHasPending: !!pd, backupHasErr: !!s.bkErr, backupErr: s.bkErr || '',
+      backupSummary: sm ? F.ymd(new Date(sm.exportedAt)) + ' 导出 · ' + sm.words + ' 个词 · ' + sm.books + ' 本书' + (sm.pending ? '（' + sm.pending + ' 本要重新导入正文，进度会自动接上）' : '') + '。恢复会覆盖这台手机上现有的词库、复习记录与设置。' : '',
+      backupCancel: () => this.setState({ bkPending: null }),
+      backupConfirm: () => this.restoreBackup()
+    };
+  }
+  exportBackupFile() {
+    const bk = exportBackup(this.data);
+    const blob = new Blob([JSON.stringify(bk)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'citi-backup-' + this.today() + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    this.data.backupAt = bk.exportedAt;
+    this.save();
+    this.flash('备份已导出 · ' + Object.keys(bk.state.entries).length + ' 个词');
+  }
+  pickBackupFile() {
+    const inp = document.createElement('input');
+    inp.type = 'file';                                   // 不写 accept：iOS/macOS 会把文件置灰（一期坑）
+    inp.onchange = async () => {
+      const f = inp.files && inp.files[0];
+      if (!f) return;
+      let json;
+      try { json = JSON.parse(await f.text()); } catch { this.setState({ bkPending: null, bkErr: '这个文件不是备份：读不出 JSON' }); return; }
+      const r = validateBackup(json);
+      if (!r.ok) { this.setState({ bkPending: null, bkErr: '备份文件不对，没有恢复任何内容：' + r.reason }); return; }
+      this.setState({ bkPending: r.backup, bkErr: '' });
+    };
+    inp.click();
+  }
+  async restoreBackup() {
+    const bk = this.s.bkPending;
+    if (!bk) return;
+    const next = applyBackup(this.data, bk);
+    clearTimeout(this._sv);                              // 防抖里还没落盘的旧 state 不许在恢复之后写回来
+    try { await this.store.saveState(next); }
+    catch (e) { this.save(); this.setState({ bkErr: '写入失败，数据没变：' + (e.message || e.name) }); return; }
+    this.data = next;
+    this.touch();
+    const sm = summarize(bk, next.books);
+    this.setState({ bkPending: null, bkErr: '', page: null, tab: 'me' });
+    this.flash('已恢复 · ' + sm.words + ' 个词' + (sm.pending ? ' · ' + sm.pending + ' 本书待重新导入' : ''));
+  }
+
   valsPages(deck) {
     const s = this.s, d = this.data, P = d.prefs;
     const sw = on => ({ bg: on ? 'var(--btn)' : 'rgba(122,122,133,.3)', x: on ? '20px' : '0px' });
     const out = {
-      pageOn: !!s.page, pageTitle: { muted: '不再替换的词', remind: '每日提醒', stat: '时长统计口径', sync: '看板同步', decks: '我的词库', newdeck: '新建词库', rvmode: '复习方式' }[s.page] || '',
+      pageOn: !!s.page, pageTitle: { muted: '不再替换的词', remind: '每日提醒', stat: '时长统计口径', sync: '看板同步', decks: '我的词库', newdeck: '新建词库', rvmode: '复习方式', backup: '备份与恢复' }[s.page] || '',
       isPageMuted: s.page === 'muted', isPageRemind: s.page === 'remind', isPageStat: s.page === 'stat', isPageSync: s.page === 'sync',
       isPageDecks: s.page === 'decks', isPageNewDeck: s.page === 'newdeck', isPageRvMode: s.page === 'rvmode',
+      ...this.valsBackup(),
       closePage: () => this.setState({ page: s.page === 'newdeck' ? 'decks' : null }),
       mutedRows: Object.keys(d.muted).map(w => ({ key: w, w, def: (this.dict.words.get(w) || {}).def || '—', restore: () => { delete d.muted[w]; this.save(); this.flash(w + ' 已恢复替换'); } })),
       mutedCountAll: Object.keys(d.muted).length,
