@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="词替">
+<meta name="theme-color" content="#F2F1F0">
+<title>词替</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="stylesheet" href="fonts.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #F2F1F0; overscroll-behavior: none; -webkit-text-size-adjust: 100%; }
+  body { font-family: 'Readex Pro', 'PingFang SC', 'Noto Sans SC', -apple-system, sans-serif; -webkit-tap-highlight-color: transparent; }
+  * { box-sizing: border-box; }
+  /* 原型 helmet 里的三组关键帧与滚动条隐藏（设计稿原文） */
+  @keyframes wt-rise { from { opacity: 0; transform: translateY(10px) } to { opacity: 1; transform: none } }
+  @keyframes wt-dash { from { stroke-dashoffset: 420 } to { stroke-dashoffset: 0 } }
+  @keyframes wt-shimmer { from { background-position: 100% 0 } to { background-position: -100% 0 } }
+  .wt-scroll { scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .wt-scroll::-webkit-scrollbar { width: 0; height: 0 }
+  input, textarea { -webkit-user-select: text; user-select: text; }
+  /* 设计稿顶部预留 54px 给系统状态栏：全屏（主屏启动）时状态栏正好压在这块；浏览器里没有状态栏，就上移让出空白 */
+  #app { position: fixed; left: 0; right: 0; bottom: 0; top: max(-40px, calc(env(safe-area-inset-top, 0px) - 54px)); margin: 0 auto; max-width: 480px; -webkit-user-select: none; user-select: none; }
+  @media (min-width: 600px) { #app { top: 20px; bottom: 20px; max-width: 390px; max-height: 844px; margin: auto; border-radius: 46px; overflow: hidden; box-shadow: 0 40px 80px -34px rgba(6,10,4,.5), 0 0 0 1px rgba(3,3,21,.1); } }
+  #boot-err { position: fixed; inset: auto 16px 24px; padding: 14px 16px; border-radius: 16px; background: #F6E2DC; color: #030315; font-size: 13px; line-height: 1.6; display: none; z-index: 999; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="boot-err"></div>
+<script src="engine/parse.js"></script>
+<script src="engine/ac.js"></script>
+<script src="engine/replace.js"></script>
+<script src="engine/scheduler.js"></script>
+<script src="engine/gbk.js"></script>
+<script src="engine/import.js"></script>
+<script src="engine/formats/deps.js"></script>
+<script src="engine/formats/inflate.js"></script>
+<script src="engine/formats/zip.js"></script>
+<script src="engine/formats/html2text.js"></script>
+<script src="engine/formats/palmdoc.js"></script>
+<script src="engine/formats/mobi.js"></script>
+<script src="engine/formats/epub.js"></script>
+<script src="engine/formats/chapters.js"></script>
+<script src="engine/formats/sniff.js"></script>
+<script src="engine/formats/index.js"></script>
+<script src="gen/sample-book.js"></script>
+<script type="module">
+  const err = m => { const e = document.getElementById('boot-err'); e.textContent = m; e.style.display = 'block'; };
+  window.addEventListener('error', e => err('出错了：' + (e.message || e.error)));
+  window.addEventListener('unhandledrejection', e => err('出错了：' + ((e.reason && e.reason.message) || e.reason)));
+  import('./src/app.js').then(m => m.start(document.getElementById('app'))).catch(e => err('启动失败：' + e.message));
+  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+</script>
+</body>
+</html>
