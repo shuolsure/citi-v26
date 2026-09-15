@@ -4,7 +4,8 @@
 //   · 写不下必须抛，调用方弹提示；不许 catch(e){} 吞掉
 //   · 一本书的所有章节一个事务写完，事务成功后才把书加进书架（半本书比没有书更坏）
 //   · 攒出来的数不存：连续天数、到期数、留存都现算；这里只存事实
-const DB_NAME = 'citi';
+// 不能叫 'citi'：GitHub Pages 上旧版 citi-app 与本应用同源（shuolsure.github.io），它已占用同名库且结构不同
+const DB_NAME = 'citi-v26';
 const DB_VER = 1;
 
 function req2p(r) { return new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
