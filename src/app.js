@@ -1325,7 +1325,8 @@ class App {
       rvReveal: () => this.setState({ rv: { ...rv, revealed: true } }),
       rvKeepDays: gr('keep').days, rvFuzzyDays: gr('fuzzy').days, rvForgetDays: gr('forget').days,
       rvKeepLabel: keepOk ? F.keepLabel(gr('keep').days) : '这次不能选', rvFuzzyLabel: F.keepLabel(gr('fuzzy').days), rvForgetLabel: F.keepLabel(gr('forget').days),
-      rvKeepBg: keepOk ? '#BFE699' : 'rgba(191,230,153,.32)', rvKeepFg: keepOk ? '#030315' : 'var(--sub2)',   // 置灰：同色系淡化，仍看得出是「记得」那颗按钮 rvKeepCursor: keepOk ? 'pointer' : 'default',
+      // 置灰：同色系淡化，仍看得出是「记得」那颗按钮（rvKeepCursor 原被这行注释吞掉，R3 验收时补回）
+      rvKeepBg: keepOk ? '#BFE699' : 'rgba(191,230,153,.32)', rvKeepFg: keepOk ? '#030315' : 'var(--sub2)', rvKeepCursor: keepOk ? 'pointer' : 'default',
       rvAgainLabel: rvSummary && this.queue().length ? '还有 ' + this.queue().length + ' 个到期词，再练一轮' : '再练一轮',
       gradeKeep: () => applyGrade('keep'), gradeFuzzy: () => applyGrade('fuzzy'), gradeForget: () => applyGrade('forget'),
       rvExit: () => this.setState({ tab: 'me', rv: null }),
