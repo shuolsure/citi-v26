@@ -336,27 +336,54 @@ export function pausedList(feedback) {
   return [...seen.values()];
 }
 
-// ---------- 阅读手势（2026-09-16 · 用户验收：翻页不跟手） ----------
+// ---------- 阅读手势与连续滚动（2026-09-16 · 用户验收：翻页不跟手 → 章与章之间要无缝） ----------
+/** 横向 40px 是「确实在往左右滑」的最小位移（翻页模式用） */
+export const SWIPE = { x: 40 };
 /**
- * 三个阈值。横向 40px 是「确实在往左右滑」的最小位移；章末上推 50px 与滚轮 160 的量级
- * 对应「已经到底了还想往下读」的那一下，不是随手一碰。
+ * 一次滑动该做什么。**纯判定**：app.js 只量位移，判据全在这里。
+ * 只有翻页模式有手势；滚动模式换章靠连续滚动（下面的 flow*），不靠「到底再推一下」——
+ * 那个做法第一版上线后用户反馈：到底停一下、再推、闪一下跳回顶部，视线被迫从最底挪到最顶。
+ * 返回 'nextPage' | 'prevPage' | null
  */
-export const SWIPE = { x: 40, pullEnd: 50, wheelEnd: 160 };
+export function swipeAction({ paged, dx, dy }) {
+  if (!paged) return null;
+  if (Math.abs(dx) < SWIPE.x || Math.abs(dx) <= Math.abs(dy)) return null;   // 斜着滑不算翻页
+  return dx < 0 ? 'nextPage' : 'prevPage';
+}
 /**
- * 一次滑动该做什么。**纯判定**：app.js 只负责量位移和「贴没贴在章末」，判据全在这里，好断言也好突变。
- *  paged        翻页模式（左右翻页）
- *  dx / dy      手指位移，右 / 下为正
- *  atEnd        松手那一刻正文已经滚到章末
- *  startedAtEnd 按下那一刻就已经在章末 —— 少了这条，从半章甩到底的那一甩会直接翻过一章
- * 返回 'nextPage' | 'prevPage' | 'nextChapter' | null
+ * 连续滚动。正文里同时挂着相邻几章，章与章之间只隔一行章节标题。
+ *  readLine  视口从上往下 30% 那条线落在哪一章，哪一章就是「在读」—— 上一章最后几行还在屏幕上半截时不急着切
+ *  above     在读章上面留几章（往回滚也是无缝的）
+ *  below     下面留几章：留 2 章，接近章末时下一章早已排好版，滚不出空白
+ *  idleMs    滚动停下多久才动「在读章上方」的 DOM（动上方要补偿 scrollTop，iOS 惯性滚动中改 scrollTop 会把惯性掐断）
  */
-export function swipeAction({ paged, dx, dy, atEnd, startedAtEnd }) {
-  if (paged) {
-    if (Math.abs(dx) < SWIPE.x || Math.abs(dx) <= Math.abs(dy)) return null;   // 斜着滑不算翻页
-    return dx < 0 ? 'nextPage' : 'prevPage';
-  }
-  if (dy > -SWIPE.pullEnd) return null;
-  return atEnd && startedAtEnd ? 'nextChapter' : null;
+export const FLOW = { readLine: 0.3, above: 1, below: 2, idleMs: 220 };
+/**
+ * geo: [{chapter, top, bottom}]（正文坐标，按章顺序）；top: scrollTop；height: 视口高
+ * 返回 { chapter, ratio }：ratio 与单章时代同口径 —— 章首顶到视口顶为 0，章末贴到视口底为 1
+ */
+export function flowLocate(geo, top, height) {
+  if (!geo || !geo.length) return null;
+  const line = top + height * FLOW.readLine;
+  const g = geo.find(x => line < x.bottom) || geo[geo.length - 1];
+  const span = g.bottom - g.top - height;
+  const ratio = span > 0 ? (top - g.top) / span : (top + height - g.top) / Math.max(1, g.bottom - g.top);
+  return { chapter: g.chapter, ratio: Math.min(1, Math.max(0, ratio)) };
+}
+/**
+ * 章窗口该长什么样。have: 现在 DOM 里的章号（升序连续）；cur: 在读章；n: 总章数
+ *  want    理想窗口 [cur-above, cur+below]
+ *  append  在读章**下面**缺的章 —— 往下接不改上方高度，随时可以接，不用等停
+ *  settled 窗口已经就是 want（停下来时就不用再动 DOM）
+ */
+export function flowPlan(have, cur, n) {
+  const lo = Math.max(0, cur - FLOW.above), hi = Math.min(n - 1, cur + FLOW.below);
+  const set = new Set(have);
+  const want = [], append = [];
+  for (let i = lo; i <= hi; i++) want.push(i);
+  for (let i = cur + 1; i <= hi; i++) if (!set.has(i)) append.push(i);
+  const settled = want.length === have.length && want.every((x, i) => x === have[i]);
+  return { want, append, settled };
 }
 
 // ---------- 六档与已会线（R2 · 01 B1 B3 · 拍板 Q6 Q7；数值依据 docs/Rebuild-1/密度量尺.md） ----------

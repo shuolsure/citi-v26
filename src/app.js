@@ -328,20 +328,21 @@ class App {
     b.openedAt = new Date().toISOString();
     this.data.lastBookId = b.id;
     const pct = b.pos && b.pos.chapter === ch ? b.pos.pct : 0;
-    this.parsedCache = null;
     this.resetScrollBase();
-    this.setState({ tab: 'reader', reader: { bookId: b.id, chapter: ch, data }, chPct: Math.round(pct * 100), rpage: 0, sheet: null, settings: false, chapters: false, sheetBook: null });
+    this.setState({ tab: 'reader', reader: { bookId: b.id, chapter: ch, data, win: [{ chapter: ch, data }] }, chPct: Math.round(pct * 100), rpage: 0, sheet: null, settings: false, chapters: false, sheetBook: null });
     this.save();
     this.startTimer();
     requestAnimationFrame(() => {
       const el = this.findReaderEl();
-      if (el) { el.scrollTop = pct * Math.max(0, el.scrollHeight - el.clientHeight); this.measurePages(); }
+      if (!el) return;
+      if (this.data.local.pageMode === 'page') { el.scrollTop = pct * Math.max(0, el.scrollHeight - el.clientHeight); this.measurePages(); return; }
+      this.flowRestore(el, pct);
     });
   }
 
   findReaderEl() { return (this.readerEl = this.root.querySelector('div[style*="padding:22px 26px 96px"]')); }
   resetScrollBase() { this._lastTop = null; this._scrollAcc = 0; this._quick = 0; }
-  leaveReader(tab = 'read') { this.resetScrollBase(); this.stopTimer(); this.flushChapter(); this.setState({ tab, reader: null, sheet: null, settings: false, chapters: false, peek: false }); this.flush(); }
+  leaveReader(tab = 'read') { clearTimeout(this._flowIdle); this.resetScrollBase(); this.stopTimer(); this.flushChapter(); this.setState({ tab, reader: null, sheet: null, settings: false, chapters: false, peek: false }); this.flush(); }
 
   measurePages() {
     const el = this.readerEl;
@@ -693,14 +694,14 @@ class App {
   }
 
   // ---------- 阅读器 ----------
-  chapterParsed() {
-    const r = this.s.reader;
-    if (!r) return null;
-    if (this.parsedCache && this.parsedCache.data === r.data) return this.parsedCache;
-    const text = r.data.text || '';
-    const p = NRParse.parseChapter(text);
-    return (this.parsedCache = { data: r.data, paras: p.paras, sents: p.sents, chars: p.chars, charN: F.charCount(text) });
+  /** 章正文切段结果按 data 对象缓存（连续滚动时窗口里同时有几章，单槽缓存会来回失效） */
+  parsedOf(data) {
+    const m = this._parsed || (this._parsed = new WeakMap());
+    let pc = m.get(data);
+    if (!pc) { const text = data.text || ''; const p = NRParse.parseChapter(text); pc = { data, paras: p.paras, sents: p.sents, chars: p.chars, charN: F.charCount(text) }; m.set(data, pc); }
+    return pc;
   }
+  chapterParsed() { const r = this.s.reader; return r ? this.parsedOf(r.data) : null; }
   valsReader(T, L, deck) {
     const s = this.s, r = s.reader;
     const fontDef = FONTS.find(x => x.k === L.font) || FONTS[0];
@@ -716,7 +717,7 @@ class App {
       setThemeLight: () => { L.theme = 'light'; this.save(); }, setThemeSepia: () => { L.theme = 'sepia'; this.save(); }, setThemeDark: () => { L.theme = 'dark'; this.save(); },
       ringLight: this.ring('light'), ringSepia: this.ring('sepia'), ringDark: this.ring('dark'),
       fontOpts: FONTS.map(x => ({ name: x.name, family: x.family, ring: L.font === x.k ? '0 0 0 2px var(--panel),0 0 0 5px #BFE699' : 'inset 0 0 0 1px rgba(122,122,133,.3)', onClick: () => { L.font = x.k; this.save(); } })),
-      setScrollMode: () => this.setPref(L, 'pageMode', 'scroll'), setPageMode: () => { this.setPref(L, 'pageMode', 'page'); requestAnimationFrame(() => this.measurePages()); },
+      setScrollMode: () => this.switchPageMode('scroll'), setPageMode: () => this.switchPageMode('page'),
       scrollModeBg: L.pageMode === 'page' ? 'var(--mute)' : 'var(--btn)', scrollModeFg: L.pageMode === 'page' ? 'var(--sub)' : 'var(--btnFg)',
       pageModeBg: L.pageMode === 'page' ? 'var(--btn)' : 'var(--mute)', pageModeFg: L.pageMode === 'page' ? 'var(--btnFg)' : 'var(--sub)',
       peekOn: L.peekOn, peekBg: L.peekOn ? 'var(--btn)' : 'rgba(122,122,133,.3)', peekX: L.peekOn ? '20px' : '0px',
@@ -733,38 +734,53 @@ class App {
     const pc = this.chapterParsed();
     const bd = this.bookDeck(b);
     const ix = this.idx.get(b.id) || { freq: {}, chWords: [] };
-    const slots = r.data.slots || [];
     const den = b.den != null ? b.den : L.den;
-    const modes = F.slotModes(slots, { ...this.slotCtx(bd, ix.freq, den, L.showEn, b.hash), chars: pc.charN });
-    this.enterChapter(b, r.chapter, slots, modes, pc.charN, den);         // 换了章才动（同一章反复重绘不重复计曝光）
-    let onPage = 0, si = 0;
-    const paras = pc.paras.map(pa => {
-      const runs = [];
-      let cur = pa.start;
-      const end = pa.start + pa.len;
-      while (si < slots.length && slots[si].o < pa.start) si++;
-      for (; si < slots.length && slots[si].o < end; si++) {
-        const sl = slots[si], mode = modes[si];
-        if (!mode) continue;
-        if (sl.o > cur) runs.push(this.textRun(pc.chars.slice(cur, sl.o).join('')));
-        runs.push(this.slotRun(sl, mode, pc, r, T));
-        if (mode !== 'zh') onPage++;
-        cur = sl.o + sl.l;
-      }
-      if (cur < end) runs.push(this.textRun(pc.chars.slice(cur, end).join('')));
-      return { runs };
-    });
-    const bookPct = this.bookPct(b);
+    const ctx = this.slotCtx(bd, ix.freq, den, L.showEn, b.hash);
     const paged = L.pageMode === 'page';
-    const last = r.chapter >= n - 1;
+    // 连续滚动（2026-09-16 · 用户验收）：滚动模式下正文里挂着一个章窗口，章与章之间一行标题；翻页模式仍只排在读这一章
+    const win = !paged && r.win && r.win.some(w => w.chapter === r.chapter) ? r.win : [{ chapter: r.chapter, data: r.data }];
+    const paras = [], secs = [];
+    let onPage = 0;
+    for (const w of win) {
+      const wpc = this.parsedOf(w.data), slots = w.data.slots || [];
+      const modes = F.slotModes(slots, { ...ctx, chars: wpc.charN });
+      const isCur = w.chapter === r.chapter;
+      if (isCur) this.enterChapter(b, r.chapter, slots, modes, wpc.charN, den);   // 只有在读章计曝光；换了章才动
+      const wr = isCur ? r : { ...r, chapter: w.chapter, data: w.data };
+      secs.push({ chapter: w.chapter, start: paras.length });
+      if (!paged) paras.push({ key: 'h' + w.chapter, runs: [this.headRun(b.chapters[w.chapter] ? b.chapters[w.chapter].t : '', T)] });
+      if (!paged && !wpc.paras.length) paras.push({ key: 'e' + w.chapter, runs: [{ ...this.textRun('这一章没有正文（导入时没切分出来）。点这里重新解析这本书，已读进度不会丢。'), style: 'color:' + T.sub + ';cursor:pointer', onClick: () => this.reparse(b.id) }] });
+      let si = 0;
+      wpc.paras.forEach((pa, k) => {
+        const runs = [];
+        let cur = pa.start;
+        const end = pa.start + pa.len;
+        while (si < slots.length && slots[si].o < pa.start) si++;
+        for (; si < slots.length && slots[si].o < end; si++) {
+          const sl = slots[si], mode = modes[si];
+          if (!mode) continue;
+          if (sl.o > cur) runs.push(this.textRun(wpc.chars.slice(cur, sl.o).join('')));
+          runs.push(this.slotRun(sl, mode, wpc, wr, T));
+          if (mode !== 'zh' && isCur) onPage++;
+          cur = sl.o + sl.l;
+        }
+        if (cur < end) runs.push(this.textRun(wpc.chars.slice(cur, end).join('')));
+        paras.push({ key: w.chapter + ':' + k, runs });
+      });
+    }
+    this._secs = paged ? null : secs;
+    this._secsParas = paras.length;
+    const bookPct = this.bookPct(b);
+    const lastCh = paged ? r.chapter : win[win.length - 1].chapter;          // 滚动模式：「读完全书」那一行只挂在全书最后
+    const last = lastCh >= n - 1;
     const qq = s.chQ.trim();
     const chList = b.chapters.map((c, i) => ({ c, i })).filter(({ c, i }) => !qq || c.t.includes(qq) || String(i + 1) === qq);
     const window0 = qq ? chList : chList.filter(({ i }) => Math.abs(i - r.chapter) <= 150);
     return Object.assign(out, {
-      paras, onPage, chMissing: !pc.paras.length, chTitle: b.chapters[r.chapter] ? b.chapters[r.chapter].t : '',
-      chEndVisible: pc.paras.length > 0 && (!paged || s.rpage >= s.pageCount - 1),
+      paras, onPage, chMissing: paged && !pc.paras.length, chTitle: b.chapters[r.chapter] ? b.chapters[r.chapter].t : '',
+      chEndVisible: paged ? pc.paras.length > 0 && s.rpage >= s.pageCount - 1 : last,
       chNextLabel: last ? (b.finishedAt ? '全书读完' : '读完全书') : '下一章 · ' + b.chapters[r.chapter + 1].t, chIsLast: last,
-      nextChapter: () => this.nextChapter(),
+      nextChapter: () => { if (!paged) this.flowSwitch(n - 1); this.nextChapter(); },
       readerFootRight: paged ? (Math.min(s.rpage, s.pageCount - 1) + 1) + ' / ' + s.pageCount : bookPct + '%',
       pctW: bookPct + '%',
       prevPage: () => this.tapPage(-1), nextPage: () => this.tapPage(1),
@@ -800,6 +816,11 @@ class App {
     const paused = F.pausedSet(this.data.feedback, bookHash);            // 本书纠错暂停的词（A11：只在这本书里不替）
     return { inDeck: w => this.newWordOf(deck, w), entryState: w => this.entryState(w), muted: w => F.userMuted(this.data.muted, w) || paused.has(w),
       lvOf: w => (this.dict.words.get(w) || { lv: 3 }).lv, freq, den, DEN_CAP: F.DEN_CAP, showEn };
+  }
+  /** 连续滚动里章与章之间的那一行标题（样式只用正文已有的颜色，块级、不缩进） */
+  headRun(title, T) {
+    return { aText: title, aStyle: '', bText: '', bStyle: 'display:none', onClick: null,
+      style: 'display:block;text-indent:0;padding:30px 0 6px;text-align:center;font-size:13px;font-weight:500;letter-spacing:.06em;line-height:1.5;color:' + T.sub };
   }
   textRun(text) { return { aText: text, aStyle: '', bText: '', bStyle: 'display:none', style: '', onClick: null }; }
   /**
@@ -869,7 +890,7 @@ class App {
     const swaps = mode === 'en';
     let shown = mode;
     if (swaps && this.s.peek) shown = 'zh';
-    const active = this.s.sheet && this.s.sheet.o === sl.o && this.s.sheet.w === sl.w;
+    const active = this.s.sheet && this.s.sheet.o === sl.o && this.s.sheet.w === sl.w && this.s.sheet.chapter === r.chapter;
     let box = 'color:' + T.ink + ';cursor:pointer;margin:0 3px;padding:0 1px 2px;';
     if (swaps) box += 'display:inline-block;position:relative;text-align:center;text-indent:0;';
     box += active ? 'border-bottom:1.5px solid ' + T.ink : 'border-bottom:1px dashed ' + T.sub + ';transition:border-color .2s';
@@ -918,9 +939,10 @@ class App {
   onReaderScroll(el) {
     this.readerEl = el;
     const r = this.s.reader; if (!r) return;
+    this.noteScroll(el);                                                   // 两种模式、两条路径都只在这里结算一屏
+    if (this._secs && this.data.local.pageMode !== 'page') { this.flowScroll(el); return; }
     const max = el.scrollHeight - el.clientHeight;
     const ratio = max > 0 ? Math.min(1, el.scrollTop / max) : 0;
-    this.noteScroll(el);
 
     const b = this.book(r.bookId);
     b.pos = { chapter: r.chapter, pct: ratio };
@@ -958,18 +980,15 @@ class App {
     if (!wrap || !(target === wrap || wrap.contains(target))) return null;
     return el;
   }
-  maxTop(el) { return Math.max(0, el.scrollHeight - el.clientHeight); }
-  atChapterEnd(el) { return el.scrollTop >= this.maxTop(el) - 2; }
   /**
-   * 用 touch 而不是 pointer：iOS 上滚动一启动就会发 pointercancel，
-   * 「已经到底了还想往下推」那一下恰好全在滚动过程里，pointer 版收不到。
+   * 用 touch 而不是 pointer：iOS 上滚动一启动就会发 pointercancel。
+   * _touching 给连续滚动用：手指还按着时不许动在读章上方的 DOM（见 flowIdle）。
    */
   bindGestures() {
     const r = this.root;
-    r.addEventListener('touchstart', e => this.gestureStart(e), { capture: true, passive: true });
-    r.addEventListener('touchend', e => this.gestureEnd(e), { capture: true, passive: true });
-    r.addEventListener('touchcancel', () => { this._g = null; }, { capture: true, passive: true });
-    r.addEventListener('wheel', e => this.gestureWheel(e), { capture: true, passive: true });
+    r.addEventListener('touchstart', e => { this._touching = true; this.gestureStart(e); }, { capture: true, passive: true });
+    r.addEventListener('touchend', e => { this._touching = false; this.gestureEnd(e); }, { capture: true, passive: true });
+    r.addEventListener('touchcancel', () => { this._touching = false; this._g = null; }, { capture: true, passive: true });
   }
   /** 左右两块点击区：刚刚那一下已经被 swipe 翻过了就不再翻（iOS 轻滑之后还会补一个 click） */
   tapPage(dir) {
@@ -979,28 +998,142 @@ class App {
   gestureStart(e) {
     const t = e.touches && e.touches[0];
     const el = t ? this.gestureEl(e.target) : null;
-    this._g = el ? { x: t.clientX, y: t.clientY, atEnd: this.atChapterEnd(el) } : null;
+    this._g = el ? { x: t.clientX, y: t.clientY } : null;
   }
   gestureEnd(e) {
     const g = this._g; this._g = null;
     const t = e.changedTouches && e.changedTouches[0];
     const el = g && t ? this.gestureEl(e.target) : null;
     if (!el) return;
-    const act = F.swipeAction({ paged: this.data.local.pageMode === 'page', dx: t.clientX - g.x, dy: t.clientY - g.y,
-      atEnd: this.atChapterEnd(el), startedAtEnd: g.atEnd });
+    const act = F.swipeAction({ paged: this.data.local.pageMode === 'page', dx: t.clientX - g.x, dy: t.clientY - g.y });
     if (!act) return;
-    if (act === 'nextChapter') { this.autoNextChapter(); return; }
     this._swipeAt = this.now();                    // 紧跟着那一下 click 是这次滑动带出来的，别再翻一页
     this.turnPage(act === 'nextPage' ? 1 : -1);
   }
-  /** 桌面端的同一件事：滚到章末还在继续往下滚，累计够一下就进下一章 */
-  gestureWheel(e) {
-    const el = this.gestureEl(e.target);
-    if (!el || this.data.local.pageMode === 'page' || e.deltaY <= 0 || !this.atChapterEnd(el)) { this._wheelAcc = 0; return; }
-    this._wheelAcc = (this._wheelAcc || 0) + e.deltaY;
-    if (this._wheelAcc < F.SWIPE.wheelEnd) return;
-    this._wheelAcc = 0;
-    this.autoNextChapter();
+
+  // ---------- 连续滚动（2026-09-16 · 用户验收：章与章之间无缝） ----------
+  /**
+   * 为什么不是「滚到底再推一下换章」：那样 DOM 里始终只有一章，换章只能整章替换再跳回顶部 ——
+   * 停一下、闪一下、视线从最底挪到最顶，怎么调手势都去不掉。正常阅读器是把下一章接在下面。
+   *
+   * 三条规矩（判定在 F.flowLocate / F.flowPlan）：
+   * ① 在读章 = 视口 30% 那条线所在的章；切章只改 s.reader.chapter / data（标题、进度、曝光跟着走），正文 DOM 不动。
+   * ② 在读章**下面**缺的章随时接（往下接不改上方高度，看不出来）。
+   * ③ 在读章**上面**的增删（裁掉读过的、补上上一章）只在滚动停下且手指没按着时做，并同步补偿 scrollTop：
+   *    iOS 惯性滚动中改 scrollTop 会把惯性掐断，那才是真正的「卡一下」。
+   */
+  flowGeo(el) {
+    const secs = this._secs;
+    if (!secs || !secs.length) return null;
+    const ps = el.querySelectorAll(':scope > p');
+    if (ps.length !== this._secsParas) return null;                     // 渲染还没落到 DOM
+    const base = el.getBoundingClientRect().top - el.scrollTop;
+    const tops = secs.map(x => ps[x.start].getBoundingClientRect().top - base);
+    const end = ps[ps.length - 1].getBoundingClientRect().bottom - base;
+    return secs.map((x, i) => ({ chapter: x.chapter, top: tops[i], bottom: i + 1 < secs.length ? tops[i + 1] : end }));
+  }
+  flowScroll(el) {
+    const r = this.s.reader, b = this.book(r.bookId);
+    const geo = this.flowGeo(el);
+    const at = geo && F.flowLocate(geo, el.scrollTop, el.clientHeight);
+    if (at) {
+      if (at.chapter !== r.chapter) this.flowSwitch(at.chapter);
+      b.pos = { chapter: at.chapter, pct: at.ratio };
+      this.noteReadRatio(at.ratio);
+      const cp = Math.round(at.ratio * 100);
+      if (cp !== this.s.chPct) { this.s.chPct = cp; this.save(); }
+    }
+    this.flowAppend();
+    clearTimeout(this._flowIdle);
+    this._flowIdle = setTimeout(() => this.flowIdle(), F.FLOW.idleMs);
+  }
+  /** 在读章换了：往后换 = 上一章读完了（与原来点「下一章」同一结算）；正文不动 */
+  flowSwitch(ch) {
+    const r = this.s.reader, b = this.book(r.bookId);
+    if (!r || ch === r.chapter) return;
+    const w = (r.win || []).find(x => x.chapter === ch);
+    if (!w) return;
+    if (ch > r.chapter) { if (!b.read.includes(r.chapter)) b.read.push(r.chapter); this.noteReadRatio(1); }
+    this.setState({ reader: { ...r, chapter: ch, data: w.data } });     // 下一次渲染里 enterChapter 结算上一章的曝光与会话
+    this.save();
+  }
+  async loadChapterData(b, i) { return (await this.store.getChapter(b.id, i)) || { title: b.chapters[i] ? b.chapters[i].t : '', text: '', slots: [] }; }
+  /** ② 往下接：只接在读章下面缺的章，不等停 */
+  async flowAppend() {
+    const r = this.s.reader;
+    if (!r || !r.win || this._flowLoading || this.data.local.pageMode === 'page') return;
+    const b = this.book(r.bookId);
+    const have = r.win.map(w => w.chapter);
+    const plan = F.flowPlan(have, r.chapter, b.chapters.length);
+    const need = plan.append.filter(i => i > have[have.length - 1]);
+    if (!need.length) return;
+    this._flowLoading = true;
+    try {
+      const add = [];
+      for (const i of need) add.push({ chapter: i, data: await this.loadChapterData(b, i) });
+      const r2 = this.s.reader;
+      if (!r2 || r2.bookId !== r.bookId || !r2.win) return;
+      const tail = r2.win[r2.win.length - 1].chapter;
+      const more = add.filter(x => x.chapter > tail);
+      if (more.length && more[0].chapter === tail + 1) this.setState({ reader: { ...r2, win: r2.win.concat(more) } });
+    } finally { this._flowLoading = false; }
+  }
+  /** ③ 停下来之后再整理窗口上方，补偿 scrollTop，看不出任何移动 */
+  async flowIdle() {
+    const r = this.s.reader;
+    if (!r || !r.win || this.data.local.pageMode === 'page' || this.s.tab !== 'reader') return;
+    if (this._touching || this._flowLoading) { clearTimeout(this._flowIdle); this._flowIdle = setTimeout(() => this.flowIdle(), F.FLOW.idleMs); return; }
+    const b = this.book(r.bookId);
+    const plan = F.flowPlan(r.win.map(w => w.chapter), r.chapter, b.chapters.length);
+    if (plan.settled) return;
+    const el = this.findReaderEl(); if (!el) return;
+    const top0 = el.scrollTop;
+    this._flowLoading = true;
+    let win;
+    try {
+      const byCh = new Map(r.win.map(w => [w.chapter, w]));
+      win = [];
+      for (const i of plan.want) win.push(byCh.get(i) || { chapter: i, data: await this.loadChapterData(b, i) });
+    } finally { this._flowLoading = false; }
+    const r2 = this.s.reader;
+    // 读取期间又滚了 / 换章了 / 按下了：这次作废，等下一次停
+    if (!r2 || r2 !== r || this._touching || Math.abs(el.scrollTop - top0) > 1) { clearTimeout(this._flowIdle); this._flowIdle = setTimeout(() => this.flowIdle(), F.FLOW.idleMs); return; }
+    this.flowApply(el, win);
+  }
+  /** 同步换窗口并补偿：以在读章标题在正文里的位置为锚，换前换后之差加回 scrollTop */
+  flowApply(el, win) {
+    const r = this.s.reader;
+    const anchor = () => { const g = this.flowGeo(el); const x = g && g.find(q => q.chapter === r.chapter); return x ? x.top : null; };
+    const before = anchor(), st = el.scrollTop;
+    this.s.reader = { ...r, win };
+    this.view.render();
+    const after = anchor();
+    if (before != null && after != null && after !== before) el.scrollTop = st + (after - before);
+    this._lastTop = el.scrollTop;                                         // 补偿不是用户滚的，别算进「一屏」
+  }
+  /** 打开书 / 切到滚动模式：定位到在读章的 pct，再把窗口补齐 */
+  flowRestore(el, pct) {
+    const geo = this.flowGeo(el);
+    const g = geo && geo.find(x => x.chapter === this.s.reader.chapter);
+    if (g && pct > 0) el.scrollTop = g.top + pct * Math.max(0, g.bottom - g.top - el.clientHeight);
+    else if (g) el.scrollTop = Math.max(0, g.top - 22);
+    this._lastTop = el.scrollTop;
+    this.flowAppend().then(() => this.flowIdle());
+  }
+  switchPageMode(mode) {
+    const L = this.data.local, r = this.s.reader;
+    if (!this.setPref(L, 'pageMode', mode)) return;
+    if (!r) return;
+    const pct = (this.s.chPct || 0) / 100;
+    this.resetScrollBase();
+    this.setState({ reader: { ...r, win: [{ chapter: r.chapter, data: r.data }] }, rpage: 0 });
+    requestAnimationFrame(() => {
+      const el = this.findReaderEl(); if (!el) return;
+      if (mode === 'scroll') { this.flowRestore(el, pct); return; }
+      el.scrollTop = 0; this.measurePages();
+      const pg = Math.round(pct * (this.s.pageCount - 1));
+      el.scrollTop = pg * this.pageStep(); this.setState({ rpage: pg });
+    });
   }
   /**
    * 翻到下一章。gotoChapter 是异步的（要从 IndexedDB 取正文），所以必须上闸：
@@ -1034,12 +1167,12 @@ class App {
     const r = this.s.reader, b = this.book(r.bookId);
     b.pos = { chapter: i, pct: 0 };
     const data = (await this.store.getChapter(b.id, i)) || { title: b.chapters[i].t, text: '', slots: [] };
-    this.parsedCache = null;
     this.resetScrollBase();
-    this.setState({ reader: { ...r, chapter: i, data }, chapters: false, sheet: null, chPct: 0, rpage: 0 });
+    this.setState({ reader: { ...r, chapter: i, data, win: [{ chapter: i, data }] }, chapters: false, sheet: null, chPct: 0, rpage: 0 });
     this.save();
     requestAnimationFrame(() => {
       if (!this.findReaderEl()) return;
+      if (this.data.local.pageMode !== 'page') { this.flowRestore(this.readerEl, 0); return; }
       this.readerEl.scrollTop = 0;
       this.measurePages();
       if (!toEnd) return;
