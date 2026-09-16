@@ -197,15 +197,18 @@ export function ebbChart(mFull, w, h, padX, padT, padB, lastN, cfg = M.DEFAULT_C
 // ---------- 替换引擎渲染阶段（PRD §12 + 已拍板 Q10 三条软规则） ----------
 /**
  * slots: 本章词位 [{o,l,w,c}]（offset 升序）
- * ctx: {inDeck(w), entryState(w) → 'learned'|'demoted'|null, muted(w), lvOf(w), freq{w:n}, den, DEN_LV, DEN_TAKE, showEn}
+ * ctx: {inDeck(w), entryState(w) → 'learned'|'demoted'|null, muted(w), lvOf(w), freq{w:n}, den, DEN_CAP, chars, showEn}
  * 返回与 slots 同序的 mode 数组：'en' | 'both' | 'zh'
  *
  * 口径：
  *  · 候选 = 词表内的词 ∪ 已记下的词（W4：词单外不补）；其余词位不标注
  *  · 已记下未忘的词：所有位置 en（PRD §18「记下后正文中该词所有位置立即变为纯英文」）
  *  · 上次选「忘了」的词：所有位置 both（PRD §19 已定：退回中英对照）
- *  · 新词：lv ≤ DEN_LV[den] 且「按本书复现次数排序后的名次 % 6 < DEN_TAKE[den]」（Q10-③，排序键全是书内固定事实 → 稳定可复现）
- *          再叠 Q10-① 同一分句只留第一处、Q10-② 同章同词第二次起降回汉语
+ *  · 新词（R2 · 01 B1 · 拍板 Q6）：六档 = 每千字上限 DEN_CAP[den]，本章名额 = floor(上限 × 本章字数 / 1000)。
+ *          候选按「本书复现次数降序 → lv 升序 → 字母序 → 位置」排（Q10-③；lv 只做并列次序，不再硬过滤），
+ *          按这个次序逐个取：同一分句已有一处（Q10-①）或本章这个词已出过（Q10-②）就跳过，取满名额为止。
+ *          排序键全是书内固定事实 → 同一本书同一状态每次打开结果一样。
+ *          （旧口径是「lv 硬过滤 + 名次取模」，那是抽样率不是密度，六级「适中」在《牧神记》上只有 3.3 / 千字，见 docs/Rebuild-1/密度量尺.md）
  */
 export function slotModes(slots, ctx) {
   const modes = new Array(slots.length).fill(null);
@@ -218,19 +221,97 @@ export function slotModes(slots, ctx) {
     if (st === 'demoted') { modes[i] = 'both'; return; }
     fresh.push(i);
   });
-  const order = fresh.slice().sort((a, b) => (ctx.freq[slots[b].w] || 0) - (ctx.freq[slots[a].w] || 0) || (slots[a].w < slots[b].w ? -1 : slots[a].w > slots[b].w ? 1 : 0) || slots[a].o - slots[b].o);
-  const rank = new Map(order.map((i, k) => [i, k]));
+  const sw = (a, b) => (slots[a].w < slots[b].w ? -1 : slots[a].w > slots[b].w ? 1 : 0);
+  const order = fresh.slice().sort((a, b) => (ctx.freq[slots[b].w] || 0) - (ctx.freq[slots[a].w] || 0) || ctx.lvOf(slots[a].w) - ctx.lvOf(slots[b].w) || sw(a, b) || slots[a].o - slots[b].o);
+  let budget = Math.floor(ctx.DEN_CAP[ctx.den] * (ctx.chars || 0) / 1000);
   const usedClause = new Set(), usedWord = new Set();
-  for (const i of fresh) {
+  for (const i of fresh) modes[i] = 'zh';
+  for (const i of order) {
+    if (budget <= 0) break;
     const s = slots[i];
-    const inDensity = ctx.lvOf(s.w) <= ctx.DEN_LV[ctx.den] && rank.get(i) % 6 < ctx.DEN_TAKE[ctx.den];
-    if (!inDensity || usedWord.has(s.w) || (s.c >= 0 && usedClause.has(s.c))) { modes[i] = 'zh'; continue; }
+    if (usedWord.has(s.w) || (s.c >= 0 && usedClause.has(s.c))) continue;
     modes[i] = 'both';
+    budget--;
     usedWord.add(s.w);
     if (s.c >= 0) usedClause.add(s.c);
   }
   return modes;
 }
+
+// ---------- 纠错作用域（R2 · 01 A11）：「这个词不对」只让本书暂停替换，不写全局 mute，不影响复习 ----------
+/** 用户自己点的「不再替换」才是全局的；旧数据里 by:'feedback' 的全局 mute 一律不认（纠错改为书内） */
+export function userMuted(muted, w) { const m = muted && muted[w]; return !!m && m.by !== 'feedback'; }
+/** 某本书里被纠错暂停的词（没有被恢复的反馈） */
+export function pausedSet(feedback, bookHash) {
+  const set = new Set();
+  if (!bookHash) return set;
+  for (const f of feedback || []) if (f.bookHash === bookHash && !f.resumedAt) set.add(f.w);
+  return set;
+}
+/** 设置页「纠错后暂停」列表：按（书，词）去重 */
+export function pausedList(feedback) {
+  const seen = new Map();
+  for (const f of feedback || []) { if (f.resumedAt || !f.bookHash) continue; const k = f.bookHash + ' ' + f.w; if (!seen.has(k)) seen.set(k, { w: f.w, bookHash: f.bookHash, at: f.at }); }
+  return [...seen.values()];
+}
+
+// ---------- 六档与已会线（R2 · 01 B1 B3 · 拍板 Q6 Q7；数值依据 docs/Rebuild-1/密度量尺.md） ----------
+/** 六档 = 每千字上限（与服务端 routes/core.mjs DEFAULT_DENSITY 同值） */
+export const DEN_CAP = [3, 5, 7, 9, 11, 13];
+/** 引导第 3 步强度预览的取样字数：600 字时六档名额 1 / 3 / 4 / 5 / 6 / 7，看得出差别 */
+export const PREVIEW_CHARS = 600;
+/** 已会线：词频名次 ≤ 线的词默认「已会」——不替、不进未学列表与书封柱。线随自测词汇量走，没自测按最保守的 300 */
+export const KNOWN_LINE = { min: 300, max: 1500, perEst: 0.5 };
+export function knownLine(quizEst) {
+  if (!(quizEst > 0)) return KNOWN_LINE.min;
+  return Math.round(Math.min(KNOWN_LINE.max, Math.max(KNOWN_LINE.min, quizEst * KNOWN_LINE.perEst)));
+}
+/** rank 缺失或 9999（词库里没有词频）不算基础词 */
+export function isBasic(rank, line) { return rank > 0 && rank < 9999 && rank <= line; }
+
+// ---------- 词频图（R2 · 01 D4 D7 D8）：书封柱 / 面板柱与图例 / 覆盖数 / 词表推荐只有这一份口径 ----------
+/**
+ * freq: bookidx 的 {w: 本书出现次数}
+ * ctx: { isDeckWord(w) 词表内且过了已会线（app.newWordOf）· hasEntry(w) 已记下 · hidden(w) 全局不再替换或本书纠错暂停 · tier(w) 'solid'|'ok'|'due'|null }
+ * 返回 { rows, hit, legend }
+ *  rows   画柱用的词 [w, n]，次数降序 → 字母序（书内固定事实，每次打开顺序一样）
+ *         = 词表内的新词 ∪ 已记下的词（D9：别的词表记下的也画，设计意图保留）
+ *         剔掉 hidden 的词（D7：正文里已经不替换了，不该继续画在图上、也不该算进覆盖数）
+ *  hit    这本书里出现过的词表词个数（含已记下的）——书封「N 个四级词」与词表推荐排序都用它（D8）
+ *  legend [牢固, 学习中, 未学]，数**全书**不是只数画出来的那几根柱（D4）
+ */
+export function bookStats(freq, ctx) {
+  const rows = [];
+  const legend = [0, 0, 0];
+  let hit = 0;
+  for (const w in freq) {
+    if (ctx.hidden(w)) continue;
+    const isDeck = ctx.isDeckWord(w);
+    if (!isDeck && !ctx.hasEntry(w)) continue;
+    if (isDeck) hit++;
+    const tr = ctx.tier(w);
+    legend[!tr ? 2 : tr === 'solid' ? 0 : 1]++;
+    rows.push([w, freq[w]]);
+  }
+  rows.sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+  return { rows, hit, legend };
+}
+/** 分桶直方图（D1 · 拍板 Q10）：横轴固定，柱高 = 落在该桶的词数，按三档掌握堆叠 */
+export const FREQ_BUCKETS = [[1, 1, '1'], [2, 2, '2'], [3, 5, '3–5'], [6, 10, '6–10'], [11, 20, '11–20'], [21, Infinity, '21+']];
+export function freqHistogram(rows, tierOfWord) {
+  const bins = FREQ_BUCKETS.map(([, , label]) => ({ label, n: 0, g: [0, 0, 0] }));
+  for (const [w, n] of rows) {
+    const i = FREQ_BUCKETS.findIndex(([lo, hi]) => n >= lo && n <= hi);
+    if (i < 0) continue;
+    const tr = tierOfWord(w);
+    bins[i].n++;
+    bins[i].g[!tr ? 2 : tr === 'solid' ? 0 : 1]++;
+  }
+  return bins;
+}
+
+/** 章节字数口径（每千字的分母）：非空白码点数，含标点。量尺脚本与阅读器同一函数 */
+export function charCount(text) { let n = 0; for (const ch of text || '') if (!/\s/.test(ch)) n++; return n; }
 
 /** 客户端自建词库归一（与服务端 customDeck.normalizeTokens 同口径） */
 export function normalizeTokens(raw) {

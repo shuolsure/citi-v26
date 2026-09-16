@@ -91,6 +91,18 @@ export async function openStore() {
     return (await req2p(t.objectStore('kv').get('bookidx:' + bookId))) || null;
   }
 
+  /** 重新对齐时一批章节一个事务（R2 · C6） */
+  async function putChapters(bookId, items) {
+    const t = db.transaction('chapters', 'readwrite');
+    for (const { i, rec } of items) t.objectStore('chapters').put(rec, bookId + ':' + i);
+    await tx2p(t);
+  }
+  async function putBookIdx(bookId, idx) {
+    const t = db.transaction('kv', 'readwrite');
+    t.objectStore('kv').put(idx, 'bookidx:' + bookId);
+    await tx2p(t);
+  }
+
   async function deleteBook(state, bookId, n) {
     const t = db.transaction(['chapters', 'kv'], 'readwrite');
     for (let i = 0; i < n; i++) t.objectStore('chapters').delete(bookId + ':' + i);
@@ -109,5 +121,5 @@ export async function openStore() {
 
   async function persist() { try { return navigator.storage && navigator.storage.persist ? await navigator.storage.persist() : false; } catch { return false; } }
 
-  return { loadState, saveState, putBook, getChapter, getBookIdx, deleteBook, wipe, persist };
+  return { loadState, saveState, putBook, getChapter, getBookIdx, putChapters, putBookIdx, deleteBook, wipe, persist };
 }
