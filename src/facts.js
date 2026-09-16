@@ -52,6 +52,23 @@ export function keepAllowed(mode, spellOk, choiceOk) {
   return true;
 }
 
+// ---------- 异常翻页剔除（R2 · Repo-1 §12-9 · 2026-09-16 扩到滚动模式） ----------
+/** 一屏停留不足这么多秒 = 「划过去了」，不是在读 */
+export const OUTLIER_MIN_SECS = 4;
+/** 连续第几屏起开始扣（第 1 屏可能是正常跳读，不扣） */
+export const OUTLIER_FROM_PAGE = 2;
+/**
+ * 结算一屏：secs 这一屏停留的秒数，quickRun 之前已经连续「划过去」几屏。
+ * 返回 { drop 这一屏的秒数要不要扣掉, quickRun 新的连续计数 }。
+ * 抽成纯函数是为了让翻页与滚动**用同一把尺子**，并且能在 Node 里断言
+ * （原来判定写在 onPageTurn 里，只有翻页模式调得到，滚动模式的设置开关是个摆设）。
+ */
+export function judgeQuickPage(secs, quickRun, outlierOn) {
+  if (!outlierOn || secs >= OUTLIER_MIN_SECS) return { drop: false, quickRun: 0 };
+  const run = (quickRun || 0) + 1;
+  return { drop: run >= OUTLIER_FROM_PAGE, quickRun: run };
+}
+
 // ---------- 打卡 ----------
 /** 从今天往前数连续 mins>0；今天没读从昨天起算（docs/00 §0） */
 export function streakOf(dailies, today) {
@@ -247,6 +264,16 @@ export function pausedSet(feedback, bookHash) {
   if (!bookHash) return set;
   for (const f of feedback || []) if (f.bookHash === bookHash && !f.resumedAt) set.add(f.w);
   return set;
+}
+/**
+ * 重对齐之后，这条纠错是不是已经被修好了（2026-09-16 · 07 闭环最后一步）。
+ * 判据：它记下的那个位置（章 + 码点偏移）现在已经不再替成同一个词 ——
+ *      桥被删掉、被判给别的英文词、或被新的否决规则挡掉，三种都算解决。
+ * 没有章 / 偏移的（从书籍面板点柱报的错）返回 false：不猜，保持手工恢复。
+ */
+export function feedbackFixed(f, slots) {
+  if (!f || f.chapter == null || f.offset == null) return false;
+  return !(slots || []).some(s => s.o === f.offset && s.w === f.w);
 }
 /** 设置页「纠错后暂停」列表：按（书，词）去重 */
 export function pausedList(feedback) {

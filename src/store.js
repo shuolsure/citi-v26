@@ -38,7 +38,8 @@ export function freshState() {
     // 本机排版（不上传）
     local: { theme: 'light', fs: 18, font: 'sys', pageMode: 'scroll', showEn: true, peekOn: true, bright: 100, autoDark: false, den: 3 },
     lastBookId: null,
-    eventSeq: 0                 // 「已上传游标」：events 仓里 seq ≤ 它的已经传过（R5 用；E6 废弃了 outbox）
+    eventSeq: 0,                // 「已上传游标」：events 仓里 seq ≤ 它的已经传过（R5 用；E6 废弃了 outbox）
+    evDropped: 0                // 有多少条事件因为不合登记表被丢掉（跟着备份导出；>0 说明这份数据有缺口）
   };
 }
 
@@ -118,9 +119,18 @@ export async function openStore() {
     return next;
   }
 
+  /**
+   * 清档 = 从头开始：三个仓一起清，**包括事件仓**。
+   * 2026-09-16 修：原来只清 chapters + kv，事件仓留着 —— 清档之后旧事件还在，
+   * 下次导出备份会把「上一轮」的事件一起带出去，R6 会把清档前后当成同一个人的连续历史，
+   * 而那正是要拿来校准模型的数据。要留分析数据就先导出备份（那是保留数据的正规途径），
+   * 不该由「清空」这个动作偷偷替用户保留。
+   * ⚠️ 当前客户端还没有清档入口（这个方法没有调用处），改语义不影响任何现有行为；
+   *    将来接入口时记得先提示「建议先导出备份」。
+   */
   async function wipe() {
-    const t = db.transaction(['chapters', 'kv'], 'readwrite');
-    t.objectStore('chapters').clear(); t.objectStore('kv').clear();
+    const t = db.transaction(['chapters', 'kv', 'events'], 'readwrite');
+    t.objectStore('chapters').clear(); t.objectStore('kv').clear(); t.objectStore('events').clear();
     await tx2p(t);
   }
 

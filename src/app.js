@@ -101,8 +101,13 @@ class App {
       this.flushEventsSoon();
       return e;
     } catch (err) {
+      // 丢弃必须留痕（2026-09-16）：原来只自增 _evBad，而那个变量**从来没有被读过** ——
+      // slot.reported 的枚举漂了三个月没人发现，就是因为丢事件在手机上完全静默（没人看控制台）。
+      // 现在：① 计数进 state → 跟着备份导出，R6 一眼能看出这份数据有缺口；② 本次会话提示一次，不打扰。
       this._evBad = (this._evBad || 0) + 1;
-      console.error('[events] 丢弃一条不合登记表的事件：', err.message);
+      if (this.data) this.data.evDropped = (this.data.evDropped || 0) + 1;
+      if (this._evBad === 1) this.flash('有事件没能记录，统计可能不全');
+      console.error('[events] 丢弃一条不合登记表的事件：', name, err.message);
       return null;
     }
   }
@@ -259,13 +264,19 @@ class App {
     if (this._dirtySecs >= 10 || final) { this._dirtySecs = 0; this.save(); this.awardBadges(); }
     else if (Math.floor(d.dailies[today].mins) !== this._lastMinShown) { this._lastMinShown = Math.floor(d.dailies[today].mins); this.touch(); this.view.schedule(); }
   }
-  /** 剔除异常翻页（outlier）：连续翻页每页 < 4 秒，这几页的秒数不计 */
+  /**
+   * 结算一屏（outlier）：连续每屏 < 4 秒，这几屏的秒数不计。
+   * 翻页模式由 turnPage / nextChapter 调；**滚动模式由 onReaderScroll 累计滚过一屏时调**
+   * （2026-09-16 修：以前只有翻页模式调得到，滚动模式下设置里那个开关完全无效，
+   *   而滚动才是默认模式 —— 快速划过的时间照常进打卡、热力、预测、勋章）。
+   * 判定本身在 F.judgeQuickPage，两条路径共用同一把尺子，Node 里可断言。
+   */
   onPageTurn() {
     const secs = this._pageSecs || 0;
     this._pageSecs = 0;
-    if (!this.data.prefs.outlier || secs >= 4) { this._quick = 0; return; }
-    this._quick = (this._quick || 0) + 1;
-    if (this._quick < 2) return;
+    const j = F.judgeQuickPage(secs, this._quick || 0, !!this.data.prefs.outlier);
+    this._quick = j.quickRun;
+    if (!j.drop) return;
     const today = this.today(), d = this.data;
     if (d.dailies[today]) d.dailies[today].mins = Math.max(0, d.dailies[today].mins - secs / 60);
     const bk = this.s.reader && this.book(this.s.reader.bookId);
@@ -311,6 +322,7 @@ class App {
     this.data.lastBookId = b.id;
     const pct = b.pos && b.pos.chapter === ch ? b.pos.pct : 0;
     this.parsedCache = null;
+    this.resetScrollBase();
     this.setState({ tab: 'reader', reader: { bookId: b.id, chapter: ch, data }, chPct: Math.round(pct * 100), rpage: 0, sheet: null, settings: false, chapters: false, sheetBook: null });
     this.save();
     this.startTimer();
@@ -321,7 +333,8 @@ class App {
   }
 
   findReaderEl() { return (this.readerEl = this.root.querySelector('div[style*="padding:22px 26px 96px"]')); }
-  leaveReader(tab = 'read') { this.stopTimer(); this.flushChapter(); this.setState({ tab, reader: null, sheet: null, settings: false, chapters: false, peek: false }); this.flush(); }
+  resetScrollBase() { this._lastTop = null; this._scrollAcc = 0; this._quick = 0; }
+  leaveReader(tab = 'read') { this.resetScrollBase(); this.stopTimer(); this.flushChapter(); this.setState({ tab, reader: null, sheet: null, settings: false, chapters: false, peek: false }); this.flush(); }
 
   measurePages() {
     const el = this.readerEl;
@@ -433,11 +446,35 @@ class App {
     }
     return null;
   }
+  /**
+   * 词典更新后，这本书里「报过错、而且已经修好」的词自动恢复替换（07 纠错闭环的最后一步，2026-09-16 补）。
+   * 判据：报错时记下的那个位置（章 + 码点偏移），重对齐之后**已经不再替成同一个词** ——
+   *      桥被删掉、被判给别的英文词、或被新的否决规则挡掉，三种情况都算「这条反馈已解决」。
+   * 位置对不上的（从书籍面板点柱报的错没有章 / 偏移）保持手工恢复，不猜。
+   * 之前只有设置页的 restore 按钮会写 resumedAt —— 服务端 release 删的是它自己的 muted_words 表，
+   * 跟本机这条队列不是一回事，所以桥修好之后那本书里的词仍然永久暂停着。
+   */
+  async resumeFixedFeedback(b) {
+    const list = (this.data.feedback || []).filter(f => f.bookHash === b.hash && !f.resumedAt && f.chapter != null && f.offset != null);
+    if (!list.length) return 0;
+    const byCh = new Map();
+    for (const f of list) { if (!byCh.has(f.chapter)) byCh.set(f.chapter, []); byCh.get(f.chapter).push(f); }
+    let n = 0;
+    const at = new Date().toISOString();
+    for (const [ch, items] of byCh) {
+      const rec = await this.store.getChapter(b.id, ch);
+      if (!rec) continue;
+      const slots = rec.slots || [];
+      for (const f of items) if (F.feedbackFixed(f, slots)) { f.resumedAt = at; n++; }
+    }
+    if (n) this.save();
+    return n;
+  }
   /** 词典版本变化后老书重新对齐：逐本、逐章，完成前阅读器用旧词位；正在读的那一章不中途换，下次翻章生效 */
   async realignBooks() {
     if (this._realigning) return;
     this._realigning = true;
-    let done = 0;
+    let done = 0, resumed = 0;
     try {
       for (const b of this.data.books.slice()) {
         const ix = this.idx.get(b.id);
@@ -450,11 +487,12 @@ class App {
           match: text => matchChapter(text, this.dict, b.guards || [])
         });
         this.idx.set(b.id, r.idx);
+        resumed += await this.resumeFixedFeedback(b);                    // 报过错、已修好的词恢复替换
         done++;
       }
     } catch (e) { this.flash('重新对齐没做完，下次打开再试：' + (e.message || e.name)); }
     finally { this._realigning = false; }
-    if (done) { this.touch(); this.flash('词典已更新，' + done + ' 本书重新对齐'); }
+    if (done) { this.touch(); this.flash('词典已更新，' + done + ' 本书重新对齐' + (resumed ? '，' + resumed + ' 个报过错的词恢复替换' : '')); }
   }
 
   async addSample() {
@@ -858,11 +896,31 @@ class App {
     const r = this.s.reader; if (!r) return;
     const max = el.scrollHeight - el.clientHeight;
     const ratio = max > 0 ? Math.min(1, el.scrollTop / max) : 0;
+    this.noteScroll(el);
+
     const b = this.book(r.bookId);
     b.pos = { chapter: r.chapter, pct: ratio };
     this.noteReadRatio(ratio);
     const cp = Math.round(ratio * 100);
     if (cp !== this.s.chPct) { this.s.chPct = cp; this.save(); }
+  }
+  /**
+   * 滚动模式下的「一屏」：累计滚动距离每满一个可视高度，就当作翻过一屏结算一次。
+   * · 只在滚动模式累计 —— 翻页模式里 turnPage 已经显式结算，再累计就是双重计数（turnPage 设置
+   *   scrollTop 也会触发 scroll 事件）。
+   * · 单次位移超过两屏的按「定位跳转」处理（换章、恢复进度、拖进度条），不计入，也不结算。
+   */
+  noteScroll(el) {
+    if (this.data.local.pageMode === 'page') { this._lastTop = el.scrollTop; return; }
+    const top = el.scrollTop;
+    const screen = Math.max(1, el.clientHeight);
+    const prev = this._lastTop == null ? top : this._lastTop;
+    this._lastTop = top;
+    const dist = Math.abs(top - prev);
+    if (dist > screen * 2) { this._scrollAcc = 0; return; }
+    this._scrollAcc = (this._scrollAcc || 0) + dist;
+    let guard = 0;
+    while (this._scrollAcc >= screen && guard++ < 20) { this._scrollAcc -= screen; this.onPageTurn(); }
   }
   turnPage(dir) {
     const el = this.findReaderEl(); if (!el) return;
@@ -881,6 +939,7 @@ class App {
     b.pos = { chapter: i, pct: 0 };
     const data = (await this.store.getChapter(b.id, i)) || { title: b.chapters[i].t, text: '', slots: [] };
     this.parsedCache = null;
+    this.resetScrollBase();
     this.setState({ reader: { ...r, chapter: i, data }, chapters: false, sheet: null, chPct: 0, rpage: 0 });
     this.save();
     requestAnimationFrame(() => { if (this.findReaderEl()) { this.readerEl.scrollTop = 0; this.measurePages(); } });
@@ -1383,10 +1442,16 @@ class App {
         const pick = [];
         for (const ln of lines) { pick.push(ln); if (F.charCount(pick.join('')) >= F.PREVIEW_CHARS) break; }
         const text = pick.join('\n\n');
-        this.sampleCache = { chars: Array.from(text), charN: F.charCount(text), slots: matchChapter(text, this.dict, sb.names) };
+        // freq 必须给：slotModes 的第一排序键是「本书出现次数」，传空对象会让排序退化成
+        // 「lv 升序 → 字母序」—— 预览里替的是最简单的词，真实阅读里替的是高频词，
+        // 名额数量对、选词口径错，而这一屏正是用来告诉用户「替出来长什么样」的（2026-09-16 修）
+        const sfreq = {};
+        const sslots = matchChapter(text, this.dict, sb.names);
+        for (const s2 of sslots) sfreq[s2.w] = (sfreq[s2.w] || 0) + 1;
+        this.sampleCache = { chars: Array.from(text), charN: F.charCount(text), slots: sslots, freq: sfreq };
       }
       const sc = this.sampleCache;
-      const modes = F.slotModes(sc.slots, { ...this.slotCtx(deck, {}, d.local.den, true), entryState: () => null, chars: sc.charN });
+      const modes = F.slotModes(sc.slots, { ...this.slotCtx(deck, sc.freq, d.local.den, true), entryState: () => null, chars: sc.charN });
       let cur = 0;
       sc.slots.forEach((sl, i) => {
         if (!modes[i]) return;

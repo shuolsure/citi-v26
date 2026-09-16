@@ -48,7 +48,8 @@ export const EVENTS = {
   'review.answered': {
     level: 'L2', q: '模型准不准：预测的留存与实际答对率对不对得上（R6 校准的唯一输入）。correct 是客观对错，grade 是用户自评，两者必须分开存。',
     fields: {
-      w: str(64), sense_id: opt(id8), mode: one('recall', 'choice', 'spell', 'context'), grade: one('keep', 'fuzzy', 'forget'),
+      // mode / grade 的取值与顺序跟界面 app.js RV_MODES 的 k、服务端 validate.mjs 对齐（逐字比较，顺序也算）
+      w: str(64), sense_id: opt(id8), mode: one('recall', 'spell', 'choice', 'context'), grade: one('keep', 'fuzzy', 'forget'),
       correct: opt(bool), latency_ms: opt(int), answer: opt(str(64)), retention: num, overdue_days: num, reviews_before: int
     }
   },
@@ -58,7 +59,12 @@ export const EVENTS = {
   },
   'slot.reported': {
     level: 'L2', q: '哪条桥被读者判为错的：R4 生产线剪枝的输入，也是唯一能修到桥的信号。',
-    fields: { w: str(64), sense_id: opt(id8), book_hash: opt(hash16), chapter: opt(int), offset: opt(int), reason: one('context', 'sense', 'example', 'proper') }
+    // reason 的四个取值必须与界面 app.js FB_REASONS 的 k、服务端 validate.mjs FB_REASONS 逐字相同。
+    // 这里曾经写成 context/sense/example/proper，与另外两处对不上 —— emit 校验不过被丢弃，
+    // 界面却一切正常（本地 feedback 照常入队、本书暂停照常生效），「释义不对」和「这个词不该被替换」
+    // 两类反馈从来没进过事件仓。三处各写一遍、只靠注释说「同口径」，就是在等它们分家；
+    // 现在由 client-smoke 的「跨端常量对齐」逐字对起来，漂一个字母就红。
+    fields: { w: str(64), sense_id: opt(id8), book_hash: opt(hash16), chapter: opt(int), offset: opt(int), reason: one('context', 'definition', 'example', 'should_not_replace') }
   },
 
   // ---------- L3 行为信号 ----------

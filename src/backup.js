@@ -74,7 +74,9 @@ export function exportBackup(state, nowIso = new Date().toISOString(), events = 
   for (const k of STATE_FIELDS) st[k] = state[k];
   // seq 是 IndexedDB 的本机自增键（「已上传游标」的刻度），不是事件的一部分：
   // 带出去会被登记表判成「没有登记的字段」，备份导出后永远导不回来（浏览器里真机跑一遍才发现）
+  // evDropped 放顶层而不是进 STATE_FIELDS：进 STATE_FIELDS 会让「必须有这个键」的校验拒掉所有老 v2 备份
   return clone({ v: STATE_V, app: BACKUP_APP, exportedAt: nowIso, lastBookHash: last ? last.hash : null, state: st, books,
+    evDropped: state.evDropped || 0,
     events: (events || []).map(({ seq, ...e }) => { void seq; return e; }) });
 }
 
@@ -98,6 +100,7 @@ function check(bk) {
   need(bk.v <= STATE_V, 'v', `是更新版本（${bk.v}）的备份，先更新应用`);
   need(isIso(bk.exportedAt), 'exportedAt', '不是时间');
   need(bk.lastBookHash === null || HASH16.test(bk.lastBookHash), 'lastBookHash', '格式不对');
+  need(bk.evDropped === undefined || (isNum(bk.evDropped) && bk.evDropped >= 0), 'evDropped', '不是条数');   // 可选：R3 之后、这条加上之前导出的备份没有它
   need(isObj(bk.state), 'state', '缺失');
   for (const k of STATE_FIELDS) { need(k in bk.state, 'state.' + k, '缺失'); need(TYPES[k](bk.state[k]), 'state.' + k, '类型不对'); }
   const S = bk.state;
@@ -172,6 +175,7 @@ export function applyBackup(cur, bk0) {
   const bk = migrateBackup(bk0);
   const next = { ...cur, v: STATE_V };
   for (const k of STATE_FIELDS) next[k] = clone(bk.state[k]);
+  next.evDropped = bk.evDropped || 0;                                   // 缺口计数跟着数据走，不跟着设备走
   const byHash = new Map(bk.books.map(b => [b.hash, b]));
   next.bookSecs = {};
   next.books = cur.books.map(b => {
