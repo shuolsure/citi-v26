@@ -18,6 +18,13 @@ export async function loadDict(base = 'dict/') {
   };
 }
 
+/** 词位对应的那条桥的 sense_id（R3 · 01 C1）：靠（词，中文表达）查，词典里没有就是 null */
+export function senseIdIn(dict, w, expr) {
+  if (!dict || !w || !expr) return null;
+  const e = dict.exprInfo.get(w + ' ' + expr);
+  return (e && e.id) || null;
+}
+
 export async function sha16(text) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
   return [...new Uint8Array(buf)].slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join('');

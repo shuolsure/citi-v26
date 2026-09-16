@@ -8,7 +8,7 @@
 import { STATE_V, migrate } from './backup.js';
 
 const DB_NAME = 'citi-v26';
-const DB_VER = 1;
+const DB_VER = 2;                 // 2：加 events 仓（R3 · 01 E4）
 
 function req2p(r) { return new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
 function tx2p(t) { return new Promise((res, rej) => { t.oncomplete = () => res(); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('事务中止')); }); }
@@ -24,7 +24,7 @@ export function freshState() {
     muted: {},                  // w → {by:'user'|'feedback', at}
     dailies: {},                // YYYY-MM-DD → {mins, newWords}
     hours: {},                  // YYYY-MM-DD → [24 个小时的秒数]
-    bookSecs: {},               // bookId → 阅读秒数
+    bookSecs: {},               // bookHash → 阅读秒数（v2 起按内容 hash，换机器也认得；由 reading.session 事件重建的缓存）
     feedback: [],               // 本地待抄检队列 {w, reason, bookHash, chapter, offset, at}
     badges: {},                 // key → gotAt
     customDecks: [],            // {id, name, words:[w], createdAt}
@@ -38,7 +38,7 @@ export function freshState() {
     // 本机排版（不上传）
     local: { theme: 'light', fs: 18, font: 'sys', pageMode: 'scroll', showEn: true, peekOn: true, bright: 100, autoDark: false, den: 3 },
     lastBookId: null,
-    outbox: []                  // 游客态写操作的接口形状副本，登录后走 /auth/merge（本期网页版不连后端）
+    eventSeq: 0                 // 「已上传游标」：events 仓里 seq ≤ 它的已经传过（R5 用；E6 废弃了 outbox）
   };
 }
 
@@ -48,6 +48,11 @@ export async function openStore() {
     const db = open.result;
     if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
     if (!db.objectStoreNames.contains('chapters')) db.createObjectStore('chapters');
+    // 事件仓：追加写，seq 自增（也是「已上传游标」的刻度）；event_id 唯一索引挡住重复导入
+    if (!db.objectStoreNames.contains('events')) {
+      const es = db.createObjectStore('events', { keyPath: 'seq', autoIncrement: true });
+      es.createIndex('event_id', 'event_id', { unique: true });
+    }
   };
   const db = await req2p(open);
   let ready = false;
@@ -119,7 +124,53 @@ export async function openStore() {
     await tx2p(t);
   }
 
+  // ---------- 事件仓（R3 · 01 E4 E6）----------
+  /**
+   * 追加一批事件。返回写进去的条数（event_id 已存在的跳过——重复导入是正常的，不算错）。
+   * 查重与写入分成两个事务：**同一个 readwrite 事务里 await 会让事务提前失活**（各浏览器行为不一致），
+   * 而这里的查重必须逐条 await。宁可多一个只读事务。
+   */
+  async function appendEvents(list) {
+    if (!ready) throw new Error('装载完成前不许写盘');
+    if (!list.length) return 0;
+    const rt = db.transaction('events', 'readonly');
+    const rix = rt.objectStore('events').index('event_id');
+    const known = await Promise.all(list.map(e => req2p(rix.getKey(e.event_id))));
+    const fresh = list.filter((e, i) => known[i] == null);
+    if (!fresh.length) return 0;
+    const t = db.transaction('events', 'readwrite');
+    const os = t.objectStore('events');
+    for (const e of fresh) { const { seq, ...rest } = e; void seq; os.add(rest); }
+    await tx2p(t);
+    return fresh.length;
+  }
+  /** seq > afterSeq 的事件，最多 limit 条（R5 上传、R6 导出都走它） */
+  async function readEvents(afterSeq = 0, limit = Infinity) {
+    const t = db.transaction('events', 'readonly');
+    const out = [];
+    await new Promise((res, rej) => {
+      const r = t.objectStore('events').openCursor(IDBKeyRange.lowerBound(afterSeq, true));
+      r.onerror = () => rej(r.error);
+      r.onsuccess = () => { const c = r.result; if (!c || out.length >= limit) return res(); out.push(c.value); c.continue(); };
+    });
+    return out;
+  }
+  async function countEvents() {
+    const t = db.transaction('events', 'readonly');
+    return req2p(t.objectStore('events').count());
+  }
+  /** 从备份恢复：覆盖不合并（与 state 同一口径）。seq 重新生成，游标归零 */
+  async function replaceEvents(list) {
+    if (!ready) throw new Error('装载完成前不许写盘');
+    const t = db.transaction('events', 'readwrite');
+    const os = t.objectStore('events');
+    os.clear();
+    for (const e of list) { const { seq, ...rest } = e; void seq; os.add(rest); }
+    await tx2p(t);
+  }
+
   async function persist() { try { return navigator.storage && navigator.storage.persist ? await navigator.storage.persist() : false; } catch { return false; } }
 
-  return { loadState, saveState, putBook, getChapter, getBookIdx, putChapters, putBookIdx, deleteBook, wipe, persist };
+  return { loadState, saveState, putBook, getChapter, getBookIdx, putChapters, putBookIdx, deleteBook, wipe, persist,
+    appendEvents, readEvents, countEvents, replaceEvents };
 }

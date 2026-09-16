@@ -3,12 +3,44 @@
 //   · 备份不含正文与词位：书只带 hash / 书名 / 章数 / 进度 / 阅读秒数
 //   · 导入先整包校验，任何一处不对整包拒并说出位置；校验通过前 state 一字不动
 //   · 书按 hash 认领（不按书名：书名能改，hash 是正文算的）；书架上没有的书只留元信息，重新导入同一本书时接上进度
-//   · bookSecs 的键是本机 bookId，换一台手机就不认识 → 备份里挂在书上（按 hash），恢复时换回本机 id
-export const STATE_V = 1;
+//   · bookSecs 的键从 R3（v2）起就是 bookHash，备份里仍挂在书上（按 hash），恢复时直接对上
+//   · 备份 v2 带事件仓（R3 · 01 E2 E4）：每条都要过登记表校验，带正文的事件在这里也会被拦下
+import { validateEvent } from '../shared/events.mjs';
+
+export const STATE_V = 2;
 export const BACKUP_APP = 'citi-v26';
 
-// state.v 迁移表：MIGRATIONS[n] 把 v=n 的 state 变成 v=n+1。R3（bookHash / 事件仓）从 1 → 2 时在这里加。
-const MIGRATIONS = {};
+/**
+ * v1 → v2（R3 · 01 C8 E5 E6）：
+ *   · entries[w].src（书名字符串）→ srcBook（bookHash）+ srcTitle（显示缓存）。**同名书不猜**：两本同名时 srcBook 留 null，
+ *     书名仍留在 srcTitle，界面照常显示。'词库' 这类不是书名的来源同理（映射不到就是 null）。
+ *   · entries[w].senseId 补出 null 占位（真值在应用启动时按 srcExpr 回填，那里才有词典）。
+ *   · bookSecs 的键 bookId → bookHash；映射不到的（书已删）丢掉——本机 id 在别处没有意义，总时长在 dailies 里不受影响。
+ *   · 去掉 outbox（E6：本地事件日志自带「已上传游标」就是 outbox）。
+ * 纯函数、不碰词典：迁移只能用 state 里已有的东西。
+ */
+function v1to2(s) {
+  const books = Array.isArray(s.books) ? s.books : [];
+  const dup = new Set(), seenTitle = new Set();
+  for (const b of books) { if (seenTitle.has(b.title)) dup.add(b.title); seenTitle.add(b.title); }
+  const byTitle = new Map();
+  for (const b of books) if (b.hash && !dup.has(b.title) && !byTitle.has(b.title)) byTitle.set(b.title, b.hash);
+  const entries = {};
+  for (const [w, e] of Object.entries(s.entries || {})) {
+    const { src, ...rest } = e;
+    const title = typeof src === 'string' && src ? src : null;
+    entries[w] = { ...rest, srcBook: byTitle.get(title) || null, srcTitle: title, senseId: e.senseId == null ? null : e.senseId };
+  }
+  const byId = new Map(books.map(b => [b.id, b.hash]));
+  const bookSecs = {};
+  for (const [id, secs] of Object.entries(s.bookSecs || {})) { const h = byId.get(id); if (h) bookSecs[h] = (bookSecs[h] || 0) + secs; }
+  const out = { ...s, entries, bookSecs };
+  delete out.outbox;
+  return out;
+}
+
+// state.v 迁移表：MIGRATIONS[n] 把 v=n 的 state 变成 v=n+1。
+const MIGRATIONS = { 1: v1to2 };
 
 /** 读取时缺省视为 1；比应用新的数据直接拒（老应用写回会把新字段抹掉） */
 export function migrate(s, migrations = MIGRATIONS, target = STATE_V) {
@@ -34,13 +66,16 @@ function bookMeta(b, secs) {
     createdAt: b.createdAt || null, secs };
 }
 
-export function exportBackup(state, nowIso = new Date().toISOString()) {
-  const books = state.books.map(b => bookMeta(b, state.bookSecs[b.id] || 0));
+export function exportBackup(state, nowIso = new Date().toISOString(), events = []) {
+  const books = state.books.map(b => bookMeta(b, state.bookSecs[b.hash] || 0));
   for (const p of state.pendingBooks || []) if (!books.some(b => b.hash === p.hash)) books.push(bookMeta(p, p.secs || 0));
   const last = state.books.find(b => b.id === state.lastBookId);
   const st = {};
   for (const k of STATE_FIELDS) st[k] = state[k];
-  return clone({ v: STATE_V, app: BACKUP_APP, exportedAt: nowIso, lastBookHash: last ? last.hash : null, state: st, books });
+  // seq 是 IndexedDB 的本机自增键（「已上传游标」的刻度），不是事件的一部分：
+  // 带出去会被登记表判成「没有登记的字段」，备份导出后永远导不回来（浏览器里真机跑一遍才发现）
+  return clone({ v: STATE_V, app: BACKUP_APP, exportedAt: nowIso, lastBookHash: last ? last.hash : null, state: st, books,
+    events: (events || []).map(({ seq, ...e }) => { void seq; return e; }) });
 }
 
 // ---------- 校验 ----------
@@ -49,6 +84,7 @@ const isObj = x => x !== null && typeof x === 'object' && !Array.isArray(x);
 const isIso = x => typeof x === 'string' && ISO.test(x) && !Number.isNaN(Date.parse(x));
 const isNum = x => typeof x === 'number' && Number.isFinite(x);
 const GRADES = ['keep', 'fuzzy', 'forget'];
+const HASH16 = /^[0-9a-f]{16}$/;
 const TYPES = { auth: x => x === null || x === 'guest', onboarded: x => typeof x === 'boolean', quizEst: isNum, entries: isObj, muted: isObj,
   feedback: Array.isArray, customDecks: Array.isArray, dailies: isObj, hours: isObj, badges: isObj, prefs: isObj, local: isObj };
 
@@ -61,7 +97,7 @@ function check(bk) {
   need(Number.isInteger(bk.v) && bk.v >= 1, 'v', '版本号不对');
   need(bk.v <= STATE_V, 'v', `是更新版本（${bk.v}）的备份，先更新应用`);
   need(isIso(bk.exportedAt), 'exportedAt', '不是时间');
-  need(bk.lastBookHash === null || /^[0-9a-f]{16}$/.test(bk.lastBookHash), 'lastBookHash', '格式不对');
+  need(bk.lastBookHash === null || HASH16.test(bk.lastBookHash), 'lastBookHash', '格式不对');
   need(isObj(bk.state), 'state', '缺失');
   for (const k of STATE_FIELDS) { need(k in bk.state, 'state.' + k, '缺失'); need(TYPES[k](bk.state[k]), 'state.' + k, '类型不对'); }
   const S = bk.state;
@@ -71,6 +107,11 @@ function check(bk) {
     need(isIso(e.firstAt), at + '.firstAt', '不是时间');
     need(e.deletedAt == null || isIso(e.deletedAt), at + '.deletedAt', '不是时间');
     need(Array.isArray(e.reviews), at + '.reviews', '不是列表');
+    if (bk.v >= 2) {                                        // v1 的词条是 src 字符串，导入时由 migrate 转成这两个字段
+      need(e.srcBook == null || HASH16.test(e.srcBook), at + '.srcBook', '不是书的内容 hash');
+      need(e.srcTitle == null || typeof e.srcTitle === 'string', at + '.srcTitle', '不是书名');
+      need(e.senseId == null || /^[0-9a-f]{8}$/.test(e.senseId), at + '.senseId', '不是 sense_id');
+    }
     e.reviews.forEach((r, i) => { need(isObj(r) && isIso(r.at), `${at}.reviews[${i}].at`, '不是时间'); need(GRADES.includes(r.grade), `${at}.reviews[${i}].grade`, '不是 keep/fuzzy/forget'); });
   }
   for (const [w, m] of Object.entries(S.muted)) need(isObj(m) && ['user', 'feedback'].includes(m.by) && isIso(m.at), 'muted.' + w, '格式不对');
@@ -82,7 +123,7 @@ function check(bk) {
   bk.books.forEach((b, i) => {
     const at = `books[${i}]`;
     need(isObj(b), at, '不是书');
-    need(typeof b.hash === 'string' && /^[0-9a-f]{16}$/.test(b.hash), at + '.hash', '格式不对');
+    need(typeof b.hash === 'string' && HASH16.test(b.hash), at + '.hash', '格式不对');
     need(!seen.has(b.hash), at + '.hash', '重复'); seen.add(b.hash);
     need(typeof b.title === 'string', at + '.title', '缺失');
     need(Number.isInteger(b.chapters) && b.chapters >= 0, at + '.chapters', '不是章数');
@@ -93,6 +134,16 @@ function check(bk) {
     need(isNum(b.secs) && b.secs >= 0, at + '.secs', '不是秒数');
     need(!('text' in b) && !('slots' in b), at, '带了正文或词位（备份不该有）');
   });
+  // v2 起带事件仓：逐条过登记表。这同时是最后一道正文闸——没登记的字段（正文最可能藏在那里）过不去
+  if (bk.v >= 2) {
+    need(Array.isArray(bk.events), 'events', '不是列表');
+    const ids = new Set();
+    bk.events.forEach((e, i) => {
+      const r = validateEvent(e);
+      need(r.ok, `events[${i}]`, '不合登记表：' + (r.ok ? '' : r.reason));
+      need(!ids.has(e.event_id), `events[${i}].event_id`, '重复'); ids.add(e.event_id);
+    });
+  } else need(!('events' in bk), 'events', `出现在 v${bk.v} 的备份里（事件仓是 v2 才有的）`);
 }
 
 /** 返回 {ok:true, backup} 或 {ok:false, reason}；不改入参 */
@@ -108,15 +159,25 @@ export function summarize(bk, shelf) {
 }
 
 /** 已校验的备份覆盖到当前 state：事实与偏好整体替换；书架上的书按 hash 认领进度，不在书架的只留元信息 */
-export function applyBackup(cur, bk) {
+/** 老版本的备份先按 MIGRATIONS 走一遍（书名 → hash 用的是备份自己的书单，不是本机书架） */
+export function migrateBackup(bk) {
+  if (bk.v >= STATE_V) return bk;
+  const m = migrate({ ...bk.state, v: bk.v, books: bk.books });
+  const st = {};
+  for (const k of STATE_FIELDS) st[k] = m[k];
+  return { ...bk, v: STATE_V, state: st, events: bk.events || [] };
+}
+
+export function applyBackup(cur, bk0) {
+  const bk = migrateBackup(bk0);
   const next = { ...cur, v: STATE_V };
   for (const k of STATE_FIELDS) next[k] = clone(bk.state[k]);
   const byHash = new Map(bk.books.map(b => [b.hash, b]));
   next.bookSecs = {};
   next.books = cur.books.map(b => {
     const m = byHash.get(b.hash);
-    if (!m) { if (cur.bookSecs[b.id]) next.bookSecs[b.id] = cur.bookSecs[b.id]; return b; }
-    if (m.secs) next.bookSecs[b.id] = m.secs;
+    if (!m) { if (cur.bookSecs[b.hash]) next.bookSecs[b.hash] = cur.bookSecs[b.hash]; return b; }
+    if (m.secs) next.bookSecs[b.hash] = m.secs;
     return claimInto(b, m);
   });
   next.pendingBooks = bk.books.filter(b => !cur.books.some(x => x.hash === b.hash)).map(clone);
