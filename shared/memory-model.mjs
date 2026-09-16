@@ -11,6 +11,7 @@
  *   · 统一到期线 DUE_AT = TARGET = 0.75：按钮「+N 天」、列表「N 日后」、进今日队列是同一时刻（E1）
  *   · 收益按复习时留存折算 f = clamp((1 − r)/(1 − TARGET), 0, 1)：刚复习完再按几乎不拿，堵刷分；
  *     按时复习 r = TARGET → f = 1，逾期 f 夹到 1，两种情况与折算前逐位相同（E2）
+ *     留存收益用 f，**稳定度收益用 f²**（2026-09-16 补：线性 f 堵不住连按，见 buildHistory 里的注释）
  *   · 按钮允许 +0 天（逾期按模糊/忘了复习完仍到期，E4）
  *   · 「牢固」按稳定度 S ≥ SOLID_S = 21 天，不按留存（E3）
  *
@@ -57,7 +58,11 @@ export function buildHistory(e, config = DEFAULT_CONFIG) {
     const r = decay(P[L], S[L], rv.at - revs[L]);       // 复习那一刻的真实留存
     const f = Math.min(1, Math.max(0, (1 - r) / (1 - c.TARGET)));   // 收益折算：离临界线越远拿得越少
     const peak = Math.min(0.99, r + (1 - r) * g.gain * f);
-    const s = g.stabilityMul === null ? c.S0 : S[L] * (1 + (g.stabilityMul - 1) * f);
+    // 稳定度按 f² 折算（2026-09-16）：f 是线性的时候，「刚复习完再按一次」仍有 f≈0.2 → ×1.25，
+    // 连按 9 次能把一个词从「4 天后」推到「16 天后」并跨过 SOLID_S 变成「牢固」，
+    // 与本文件开头写的「刚复习完再按几乎不拿，堵刷分」对不上。f² 让按时复习（f=1）逐位不变，
+    // 刚复习完从 ×1.25 降到 ×1.05。判据：idealSchedule 的 S 序列不许变（smoke.mjs）。
+    const s = g.stabilityMul === null ? c.S0 : S[L] * (1 + (g.stabilityMul - 1) * f * f);
     revs.push(rv.at); P.push(peak); S.push(s);
   }
   return { revs, P, S, n: revs.length };

@@ -35,6 +35,12 @@ const FB_REASONS = [
   { k: 'example', name: '例句或音标有误', hint: '词本身没问题，附属信息有错' },
   { k: 'should_not_replace', name: '这个词不该被替换', hint: '人名、地名或固定说法' }
 ];
+// 「这台设备上做不到」的说明框文案（2026-09-16）。每日提醒本来就有一条；看板同步原来什么都不说，
+// 却在「我的」里显示「随账号」—— 而网页版没有账号，prefs.sync 全局没有第二处读它，拨了不会有任何变化。
+const ASK_COPY = {
+  sub: { title: '开启每日提醒', body: '每日提醒要用微信小程序的订阅消息推送，一次授权对应一次推送。当前是网页版，收不到推送；在小程序里打开这个开关才会生效。' },
+  sync: { title: '看板同步', body: '看板布局要有账号才能跟着人走。当前是网页版（游客），布局只存在这台设备上，这个开关拨到哪一档都一样；换设备请用「备份与恢复」。在小程序里登录后它才会生效。' }
+};
 const ND_SRC = ['粘贴词单', '从现有词库挑', '从书里的生词'];
 const WIDGETS = {
   heat: { name: '阅读日历', icon: 'M4 6h16v14H4zM4 10h16M8 3v4M16 3v4', bg: '#FFFFFF', tinted: false },
@@ -652,8 +658,9 @@ class App {
   cycleDeck() {
     const decks = this.allDecks();
     const i = decks.findIndex(x => x.id === this.data.prefs.deckId);
-    this.data.prefs.deckId = decks[(i + 1) % decks.length].id;
-    this.save();
+    // 走 setPref（2026-09-16 修）：这颗顶部循环按钮原来直接赋值 + save()，于是「换词表」这个
+    // 登记表点名要看的设置（events.mjs setting.changed 的 q）只有设置页那条路径采得到
+    this.setPref(this.data.prefs, 'deckId', decks[(i + 1) % decks.length].id, 'deckId');
     this.flash('当前词库 · ' + this.curDeck().short);
   }
 
@@ -692,11 +699,11 @@ class App {
       fs: L.fs, lh: L.fs >= 20 ? 2.15 : 2.05, readerFont: fontDef.family, paged: L.pageMode === 'page', readerScroll: L.pageMode === 'page' ? 'hidden' : 'auto',
       toggleSettings: () => this.setState({ settings: !s.settings, sheet: null, chapters: false }),
       toggleChapters: () => this.setState({ chapters: !s.chapters, sheet: null, settings: false }),
-      fsUp: () => { L.fs = Math.min(22, L.fs + 1); this.save(); }, fsDown: () => { L.fs = Math.max(15, L.fs - 1); this.save(); },
+      fsUp: () => this.setPref(L, 'fs', Math.min(22, L.fs + 1), 'fs'), fsDown: () => this.setPref(L, 'fs', Math.max(15, L.fs - 1), 'fs'),
       fsW: Math.round((L.fs - 15) / 7 * 100) + '%', fsTrans: s.fsDrag ? '0s' : '.22s cubic-bezier(.4,0,.2,1)',
       fsRef: el => { this.fsEl = el; },
-      fsDragStart: e => { if (e.currentTarget.setPointerCapture) e.currentTarget.setPointerCapture(e.pointerId); this.setState({ fsDrag: true }); this.fsFromX(e.clientX); },
-      fsDragMove: e => { if (this.s.fsDrag) this.fsFromX(e.clientX); }, fsDragEnd: () => this.setState({ fsDrag: false }),
+      fsDragStart: e => { if (e.currentTarget.setPointerCapture) e.currentTarget.setPointerCapture(e.pointerId); this._fsFrom = L.fs; this.setState({ fsDrag: true }); this.fsFromX(e.clientX); },
+      fsDragMove: e => { if (this.s.fsDrag) this.fsFromX(e.clientX); }, fsDragEnd: () => { this.noteFsDrag(); this.setState({ fsDrag: false }); },
       setThemeLight: () => { L.theme = 'light'; this.save(); }, setThemeSepia: () => { L.theme = 'sepia'; this.save(); }, setThemeDark: () => { L.theme = 'dark'; this.save(); },
       ringLight: this.ring('light'), ringSepia: this.ring('sepia'), ringDark: this.ring('dark'),
       fontOpts: FONTS.map(x => ({ name: x.name, family: x.family, ring: L.font === x.k ? '0 0 0 2px var(--panel),0 0 0 5px #BFE699' : 'inset 0 0 0 1px rgba(122,122,133,.3)', onClick: () => { L.font = x.k; this.save(); } })),
@@ -870,6 +877,14 @@ class App {
     };
   }
   ring(t) { return this.data.local.theme === t ? '0 0 0 2px var(--panel),0 0 0 5px #BFE699' : 'inset 0 0 0 1px rgba(122,122,133,.3)'; }
+  /** 拖动字号只在松手时采一条 setting.changed：拖的过程中每一帧都采会把事件仓灌满（fsFromX 每次 pointermove 都跑） */
+  noteFsDrag() {
+    const from = this._fsFrom;
+    this._fsFrom = null;
+    const to = this.data.local.fs;
+    if (from == null || from === to) return;
+    this.emit('setting.changed', { key: 'fs', from: String(from), to: String(to) });
+  }
   fsFromX(x) {
     const el = this.fsEl; if (!el) return;
     const rc = el.getBoundingClientRect(); if (!rc.width) return;
@@ -1070,12 +1085,14 @@ class App {
         { name: '删除这本书', hint: '书与阅读进度一起删，已记的词保留在词库', icon: 'M5 7h14M9 7V5h6v2M7 7l1 13h8l1 -13', color: '#B0503A', onClick: () => this.setState({ bkMenu: null, ask: { kind: 'del', id: bm.id } }) }
       ] : []
     });
+    // 确认框三种：删书 / 开每日提醒 / 看板同步。后两种都是「这台设备上做不到」的说明框，
+    // 确认键只是「知道了」，不改任何状态 —— 界面不该声称一件当前构建做不到的事（ASK_COPY）。
     const ask = s.ask;
     const delBook = ask && ask.kind === 'del' ? this.book(ask.id) : null;
+    const askCopy = delBook ? null : ASK_COPY[(ask && ask.kind) || 'sub'] || ASK_COPY.sub;
     Object.assign(out, {
-      askTitle: delBook ? '删除《' + delBook.title + '》' : '开启每日提醒',
-      askBody: delBook ? '这本书的正文、章节与阅读进度会一起删掉。从它里记下的词仍留在词库，复习排程不受影响。'
-        : '每日提醒要用微信小程序的订阅消息推送，一次授权对应一次推送。当前是网页版，收不到推送；在小程序里打开这个开关才会生效。',
+      askTitle: delBook ? '删除《' + delBook.title + '》' : askCopy.title,
+      askBody: delBook ? '这本书的正文、章节与阅读进度会一起删掉。从它里记下的词仍留在词库，复习排程不受影响。' : askCopy.body,
       askYes: delBook ? '删 除' : '知道了', askNo: delBook ? '不删' : '暂不', askYesBg: delBook ? '#B0503A' : 'var(--btn)', askYesFg: delBook ? '#FFFFFF' : 'var(--btnFg)',
       askConfirm: async () => {
         if (delBook) {
@@ -1233,10 +1250,11 @@ class App {
     const hoursCaption = hrTotal ? `最常在 ${peakB * 2}–${peakB * 2 + 2} 点读，夜读占 ${nightShare}%` : '近 30 天还没有阅读记录';
     // 生词来源：本月
     const monthKey = today.slice(0, 7);
-    const srcCount = {};
-    for (const w in d.entries) { const e = d.entries[w]; if (this.entry(w) && F.ymd(new Date(e.firstAt)).startsWith(monthKey)) { const k = e.srcTitle || '其他'; srcCount[k] = (srcCount[k] || 0) + 1; } }
-    const srcRows = Object.entries(srcCount).sort((a, b) => b[1] - a[1]).slice(0, 4);
-    const source = srcRows.map(([title, n]) => { const b = d.books.find(x => x.title === title); const tone = b ? b.tone : '#5C6B45'; return { title, n: n + ' 词', barW: Math.round(n / srcRows[0][1] * 100) + '%', c: 'color-mix(in oklab,' + tone + ' 62%,#FFFFFF)' }; });
+    // 按内容 hash 聚合（F.sourceRows）：改书名不再把同一本书裂成两条，口径与下面分享卡的 shareN 一致
+    const srcRows = F.sourceRows(d.entries, d.books, monthKey, w => !!this.entry(w));
+    const srcMax = srcRows.length ? srcRows[0].n : 1;
+    const source = srcRows.map(r => ({ title: r.title, n: r.n + ' 词', barW: Math.round(r.n / srcMax * 100) + '%',
+      c: 'color-mix(in oklab,' + (r.tone || '#5C6B45') + ' 62%,#FFFFFF)' }));
     // 词库对比
     const deckRows = this.allDecks().map(x => { const ln = this.learnedIn(x), p = x.total ? Math.round(ln / x.total * 100) : 0; const cur = x.id === P.deckId;
       return { key: x.id, name: x.short, pct: p + '%', barW: p + '%', sub: ln + ' / ' + x.total, weight: cur ? 600 : 400, c: cur ? 'var(--bar)' : '#C7DEA6', onClick: () => this.setPref(P, 'deckId', x.id) }; });
@@ -1296,7 +1314,7 @@ class App {
         { icon: 'M4 4l16 16M10 5a7 7 0 0 1 9 7M5 12a7 7 0 0 0 9 7', label: '不再替换的词', value: mutedN + ' 个', onClick: () => this.setState({ page: 'muted' }) },
         { icon: 'M18 9a6 6 0 1 0 -12 0c0 4 -1.5 5 -2 6h16c-.5 -1 -2 -2 -2 -6M10 20a2.2 2.2 0 0 0 4 0', label: '每日提醒', value: P.remind ? P.remindAt : '已关闭', onClick: () => this.setState({ page: 'remind' }) },
         { icon: 'M12 4a8 8 0 1 0 0 16a8 8 0 0 0 0 -16M12 8v4l3 2', label: '时长统计口径', value: '无操作 ' + P.idle + ' 分钟', onClick: () => this.setState({ page: 'stat' }) },
-        { icon: 'M4 8h13l-3 -3M20 16H7l3 3', label: '看板同步', value: P.sync ? '随账号' : '仅本机', onClick: () => this.setState({ page: 'sync' }) },
+        { icon: 'M4 8h13l-3 -3M20 16H7l3 3', label: '看板同步', value: '仅本机', onClick: () => this.setState({ page: 'sync' }) },   // 网页版没有账号，无论 prefs.sync 在哪一档都只存本机
         { icon: 'M12 4v11M7.5 10.5L12 15l4.5 -4.5M5 19h14', label: '备份与恢复', value: d.backupAt ? '上次 ' + F.ymd(new Date(d.backupAt)).slice(5) : '未备份', onClick: () => this.setState({ page: 'backup', bkPending: null, bkErr: '' }) }
       ],
       startReview: () => this.openReview(),
@@ -1359,7 +1377,8 @@ class App {
       const pool = [...deck.words].filter(w => w !== curW && this.dict.words.has(w));
       const h = hashStr(curW);
       const picks = [];
-      for (let k = 0; picks.length < 3 && k < 50 && pool.length; k++) { const def = this.dict.words.get(pool[(h + k * 7919) % pool.length]).def; if (def && def !== dw.def && !picks.includes(def)) picks.push(def); }
+      const senses = F.defSenses(dw.def);                                  // 干扰项不能与正确释义共享义项（F.distractorOk）
+      for (let k = 0; picks.length < 3 && k < 120 && pool.length; k++) { const def = this.dict.words.get(pool[(h + k * 7919) % pool.length]).def; if (F.distractorOk(dw.def, def, senses) && !picks.includes(def)) picks.push(def); }
       picks.splice(h % 4, 0, dw.def || '');
       choiceDefs.push(...picks);
     }
@@ -1580,10 +1599,11 @@ class App {
       mutedCountAll: Object.keys(d.muted).filter(w => F.userMuted(d.muted, w)).length + F.pausedList(d.feedback).length,
       remindOn: P.remind, remindBg: sw(P.remind).bg, remindX: sw(P.remind).x,
       toggleRemind: () => { if (P.remind) { P.remind = false; this.save(); this.flash('每日提醒已关闭'); } else this.setState({ ask: { kind: 'sub' } }); },
-      idleMin: P.idle, cycleIdle: () => { P.idle = P.idle === 3 ? 5 : P.idle === 5 ? 10 : 3; this.save(); },
+      idleMin: P.idle, cycleIdle: () => this.setPref(P, 'idle', P.idle === 3 ? 5 : P.idle === 5 ? 10 : 3, 'idle'),
       bgOn: P.bgCount, bgBg: sw(P.bgCount).bg, bgX: sw(P.bgCount).x, toggleBg: () => { P.bgCount = !P.bgCount; this.save(); },
       outOn: P.outlier, outBg: sw(P.outlier).bg, outX: sw(P.outlier).x, toggleOut: () => { P.outlier = !P.outlier; this.save(); },
-      syncOn: P.sync, syncBg: sw(P.sync).bg, syncX: sw(P.sync).x, toggleSync: () => { P.sync = !P.sync; this.save(); },
+      // 与 toggleRemind 同一处理：说明当前构建做不到，并且**不改值**（改了也没有任何效果，只会让人以为生效了）
+      syncOn: P.sync, syncBg: sw(P.sync).bg, syncX: sw(P.sync).x, toggleSync: () => this.setState({ ask: { kind: 'sync' } }),
       presets: Object.keys(PRESETS).map(k => ({ name: k, count: PRESETS[k].length + ' 个组件', apply: () => { P.board = PRESETS[k].slice(); this.save(); this.setState({ page: null, tab: 'me' }); this.flash('已套用「' + k + '」'); } })),
       deckPageRows: this.allDecks().map(x => { const ln = this.learnedIn(x), p = x.total ? Math.round(ln / x.total * 100) : 0, cur = x.id === P.deckId;
         return { key: x.id, name: x.name + (x.custom ? ' · 自建' : ''), sub: ln + ' / ' + x.total + ' 词', barW: p + '%', barC: cur ? 'var(--bar)' : 'rgba(122,122,133,.3)', weight: cur ? 600 : 400,

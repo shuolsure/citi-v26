@@ -1,2 +1,2 @@
-export const MODEL_VERSION = "d5367d939a20";
-export const APP_VERSION = "df8a7855c505";
+export const MODEL_VERSION = "d828642f78b5";
+export const APP_VERSION = "4e188a278e20";

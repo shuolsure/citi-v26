@@ -69,6 +69,60 @@ export function judgeQuickPage(secs, quickRun, outlierOn) {
   return { drop: run >= OUTLIER_FROM_PAGE, quickRun: run };
 }
 
+// ---------- 四选一干扰项（2026-09-16 修）----------
+/**
+ * 释义切成「义项集合」：按中英文标点切，只丢空串。
+ * 只用来判断两条释义是不是在说同一件事，不参与任何展示。
+ * ★ 单字义项**不能丢**：第一版写的是「长度 > 1 才要」，结果漏掉 gaokao 词表的
+ *   man「男人, 人类, 人」撞 soul「…, 人, …」——两个选项都对。而且当时的断言用
+ *   distractorOk 去验 distractorOk 挑出来的结果，是同义反复，扫全表照样 0 冲突。
+ *   现在 client-smoke 用独立口径（直接切字符串比交集）复核，这一条才挡得住。
+ */
+export function defSenses(def) {
+  const out = new Set();
+  for (const t of String(def || '').split(/[；;，,、/／|｜]+/)) { const k = t.trim(); if (k) out.add(k); }
+  return out;
+}
+/**
+ * 这条释义能不能当干扰项：与正确释义共享任何一个义项就不能。
+ * 旧口径只比字符串完全相等，于是放过了这一类（实测 CET-4 3791 词里有 5 个）：
+ *   ceiling 正确「天花板」 干扰「经常开支, 普通用费, 天花板」—— 两个选项都对
+ *   vivid   正确「生动的, 鲜明的, …」 干扰「活泼的, 鲜明的, 生动的」—— 干扰项是正确答案的真子集
+ * 而干扰项是按词 hash 确定性挑的（刷新不变），所以撞上的词**每一次复习都是同一道坏题**，
+ * 还会因为「选错了」把「记得」按钮置灰（keepAllowed），比单纯答错更伤。
+ */
+export function distractorOk(correctDef, candDef, correctSenses) {
+  if (!candDef || candDef === correctDef) return false;
+  const a = correctSenses || defSenses(correctDef);
+  for (const x of defSenses(candDef)) if (a.has(x)) return false;
+  return true;
+}
+
+// ---------- 生词来源（2026-09-16 修）----------
+/**
+ * 「生词来源」看板按**内容 hash** 聚合，不按书名 —— 书名能改，hash 是正文算出来的。
+ * 旧口径 `const k = e.srcTitle || '其他'` 会让「改一次书名」把同一本书裂成两条记录，
+ * 而同一件事在分享卡那边（app.js valsMe shareN）早就是 hash 优先，两处口径不一致。
+ * 退回书名只发生在三种情况：从词库记下的（没有 srcBook）、书已从书架删掉、v1 迁移时映射不到。
+ * @param entries  state.entries · @param books 书架 · @param monthKey 'YYYY-MM' · @param isActive (w)=>bool
+ * @returns [{ key, title, tone, n }] 次数降序 → 标题序，最多 limit 条
+ */
+export function sourceRows(entries, books, monthKey, isActive, limit = 4) {
+  const byHash = new Map((books || []).map(b => [b.hash, b]));
+  const acc = new Map();
+  for (const w of Object.keys(entries || {})) {
+    const e = entries[w];
+    if (!isActive(w) || !e || !e.firstAt) continue;
+    if (!ymd(new Date(e.firstAt)).startsWith(monthKey)) continue;
+    const b = e.srcBook ? byHash.get(e.srcBook) : null;
+    const key = b ? 'h:' + b.hash : 't:' + (e.srcTitle || '其他');
+    const cur = acc.get(key);
+    if (cur) cur.n++;
+    else acc.set(key, { key, title: b ? b.title : (e.srcTitle || '其他'), tone: b ? b.tone : null, n: 1 });
+  }
+  return [...acc.values()].sort((a, b) => b.n - a.n || (a.title < b.title ? -1 : 1)).slice(0, limit);
+}
+
 // ---------- 打卡 ----------
 /** 从今天往前数连续 mins>0；今天没读从昨天起算（docs/00 §0） */
 export function streakOf(dailies, today) {
