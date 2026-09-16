@@ -14,6 +14,7 @@ export async function loadDict(base = 'dict/') {
   for (const b of bridgeArr) for (const e of b.exprs) exprInfo.set(b.word_id + ' ' + e.zh, e);
   return {
     words: map, bridgeArr, exprInfo, veto, vetoIdx: NRReplace.vetoIndex(veto), version: ver.v,   // 匹配版本：桥 + 否决表 + 匹配代码的内容 hash（构建时算，R2 · C6）
+    pack: ver.pack || null,   // 整包版本（R4 · 01 C4）：生产线产出的那一版词典的编号，只用来报出去，不参与重对齐判定
     decks: decks.map(d => ({ id: d.id, name: d.name, short: d.short, wpm: d.wpm, custom: false, words: new Set(d.words), total: d.words.length })),
   };
 }
