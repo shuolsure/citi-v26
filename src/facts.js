@@ -336,10 +336,37 @@ export function pausedList(feedback) {
   return [...seen.values()];
 }
 
+// ---------- 阅读手势（2026-09-16 · 用户验收：翻页不跟手） ----------
+/**
+ * 三个阈值。横向 40px 是「确实在往左右滑」的最小位移；章末上推 50px 与滚轮 160 的量级
+ * 对应「已经到底了还想往下读」的那一下，不是随手一碰。
+ */
+export const SWIPE = { x: 40, pullEnd: 50, wheelEnd: 160 };
+/**
+ * 一次滑动该做什么。**纯判定**：app.js 只负责量位移和「贴没贴在章末」，判据全在这里，好断言也好突变。
+ *  paged        翻页模式（左右翻页）
+ *  dx / dy      手指位移，右 / 下为正
+ *  atEnd        松手那一刻正文已经滚到章末
+ *  startedAtEnd 按下那一刻就已经在章末 —— 少了这条，从半章甩到底的那一甩会直接翻过一章
+ * 返回 'nextPage' | 'prevPage' | 'nextChapter' | null
+ */
+export function swipeAction({ paged, dx, dy, atEnd, startedAtEnd }) {
+  if (paged) {
+    if (Math.abs(dx) < SWIPE.x || Math.abs(dx) <= Math.abs(dy)) return null;   // 斜着滑不算翻页
+    return dx < 0 ? 'nextPage' : 'prevPage';
+  }
+  if (dy > -SWIPE.pullEnd) return null;
+  return atEnd && startedAtEnd ? 'nextChapter' : null;
+}
+
 // ---------- 六档与已会线（R2 · 01 B1 B3 · 拍板 Q6 Q7；数值依据 docs/Rebuild-1/密度量尺.md） ----------
-/** 六档 = 每千字上限（与服务端 routes/core.mjs DEFAULT_DENSITY 同值） */
-export const DEN_CAP = [3, 5, 7, 9, 11, 13];
-/** 引导第 3 步强度预览的取样字数：600 字时六档名额 1 / 3 / 4 / 5 / 6 / 7，看得出差别 */
+/**
+ * 六档 = 每千字上限（与服务端 routes/core.mjs DEFAULT_DENSITY 同值）。
+ * 2026-09-16 用户验收：原来的 3 / 5 / 7 / 9 / 11 / 13 六档整体太稀，最密一档读下来也几乎碰不到英文，
+ * 拍板「每一档都乘 2」——档位关系不变，只把整条尺子拉到两倍。
+ */
+export const DEN_CAP = [6, 10, 14, 18, 22, 26];
+/** 引导第 3 步强度预览的取样字数：600 字时六档名额 3 / 6 / 8 / 10 / 13 / 15，看得出差别 */
 export const PREVIEW_CHARS = 600;
 /** 已会线：词频名次 ≤ 线的词默认「已会」——不替、不进未学列表与书封柱。线随自测词汇量走，没自测按最保守的 300 */
 export const KNOWN_LINE = { min: 300, max: 1500, perEst: 0.5 };

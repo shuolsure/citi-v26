@@ -172,6 +172,7 @@ class App {
     document.addEventListener('visibilitychange', () => { if (document.hidden) { this.tickTimer(true); this.flushChapter(); this.flush(); } });
     window.addEventListener('pagehide', () => { this.tickTimer(true); this.flushChapter(); this.flush(); });
     this.root.addEventListener('scroll', e => this.onAnyScroll(e), true);
+    this.bindGestures();
     for (const t of ['pointerdown', 'keydown', 'scroll']) this.root.addEventListener(t, () => { this.lastAct = Date.now(); }, { capture: true, passive: true });
   }
 
@@ -536,10 +537,18 @@ class App {
 
   vals() {
     const s = this.s;
-    const t = this.theme(), V = this.vars(t), T = this.paper(t);
+    /**
+     * 背景色三档（白 / 米黄 / 纯黑）**只染阅读页**（2026-09-16 · 用户验收）。
+     * 以前 vars(t) 是整壳的 CSS 变量源：在书里选「纯黑」，退出来书架、词库、「我」全跟着黑了 ——
+     * 那三颗色卡在阅读器的 Aa 面板里，用户的预期是「这本书的纸」，不是换整个 App 的皮肤。
+     * 现在：阅读页内（含它自己的 Aa / 目录 / 释义浮层，都在 reader 这一层）跟着主题走，外面恒定浅色。
+     * paper(t) 那三个值（ink / sub / chipBg）本来就只在阅读器模板里用，不用再关一道。
+     */
+    const inReader = s.tab === 'reader';
+    const t = this.theme(), V = this.vars(inReader ? t : 'light'), T = this.paper(t);
     const base = {
-      shellBg: s.tab === 'reader' ? T.paper : V.ground, vCard: V.card, vPanel: V.panel, vInk: V.ink, vSub: V.sub, vSub2: V.sub2, vMute: V.mute,
-      vLine: V.line, vBtn: V.btn, vBtnFg: V.btnFg, vBar: V.bar, vCardSh: V.cardSh, ink: s.tab === 'reader' ? T.ink : '#030315', sub: T.sub, chipBg: T.chip,
+      shellBg: inReader ? T.paper : V.ground, vCard: V.card, vPanel: V.panel, vInk: V.ink, vSub: V.sub, vSub2: V.sub2, vMute: V.mute,
+      vLine: V.line, vBtn: V.btn, vBtnFg: V.btnFg, vBar: V.bar, vCardSh: V.cardSh, ink: inReader ? T.ink : '#030315', sub: T.sub, chipBg: T.chip,
       fadeFrom: 'rgba(255,255,255,0)', fadeTo: T.paper, noop: () => {}, toast: s.toast || '', toastOpacity: s.toast ? 1 : 0, toastY: s.toast ? '0px' : '8px'
     };
     if (!this.data || !this.dict) {
@@ -758,7 +767,7 @@ class App {
       nextChapter: () => this.nextChapter(),
       readerFootRight: paged ? (Math.min(s.rpage, s.pageCount - 1) + 1) + ' / ' + s.pageCount : bookPct + '%',
       pctW: bookPct + '%',
-      prevPage: () => this.turnPage(-1), nextPage: () => this.turnPage(1),
+      prevPage: () => this.tapPage(-1), nextPage: () => this.tapPage(1),
       onScroll: e => this.onReaderScroll(e.currentTarget),
       reparse: () => this.reparse(b.id),
       chQ: s.chQ, onChQ: e => this.setState({ chQ: e.target.value }), hasChQ: !!s.chQ, clearChQ: () => this.setState({ chQ: '' }),
@@ -937,19 +946,91 @@ class App {
     let guard = 0;
     while (this._scrollAcc >= screen && guard++ < 20) { this._scrollAcc -= screen; this.onPageTurn(); }
   }
+  // ---------- 阅读手势（2026-09-16 · 用户验收：翻页不跟手） ----------
+  /**
+   * 手势只认「阅读器正文那一层」。设置 / 目录 / 释义 / 遮罩都挂在 reader 外面那一层，
+   * 用 wrap.contains(target) 一次全排除掉，不用逐个列浮层开关（漏一个就会在浮层上误翻页）。
+   */
+  gestureEl(target) {
+    if (this.s.tab !== 'reader' || !this.s.reader) return null;
+    const el = this.findReaderEl();
+    const wrap = el && el.parentNode;
+    if (!wrap || !(target === wrap || wrap.contains(target))) return null;
+    return el;
+  }
+  maxTop(el) { return Math.max(0, el.scrollHeight - el.clientHeight); }
+  atChapterEnd(el) { return el.scrollTop >= this.maxTop(el) - 2; }
+  /**
+   * 用 touch 而不是 pointer：iOS 上滚动一启动就会发 pointercancel，
+   * 「已经到底了还想往下推」那一下恰好全在滚动过程里，pointer 版收不到。
+   */
+  bindGestures() {
+    const r = this.root;
+    r.addEventListener('touchstart', e => this.gestureStart(e), { capture: true, passive: true });
+    r.addEventListener('touchend', e => this.gestureEnd(e), { capture: true, passive: true });
+    r.addEventListener('touchcancel', () => { this._g = null; }, { capture: true, passive: true });
+    r.addEventListener('wheel', e => this.gestureWheel(e), { capture: true, passive: true });
+  }
+  /** 左右两块点击区：刚刚那一下已经被 swipe 翻过了就不再翻（iOS 轻滑之后还会补一个 click） */
+  tapPage(dir) {
+    if (this._swipeAt && this.now() - this._swipeAt < 400) return;
+    this.turnPage(dir);
+  }
+  gestureStart(e) {
+    const t = e.touches && e.touches[0];
+    const el = t ? this.gestureEl(e.target) : null;
+    this._g = el ? { x: t.clientX, y: t.clientY, atEnd: this.atChapterEnd(el) } : null;
+  }
+  gestureEnd(e) {
+    const g = this._g; this._g = null;
+    const t = e.changedTouches && e.changedTouches[0];
+    const el = g && t ? this.gestureEl(e.target) : null;
+    if (!el) return;
+    const act = F.swipeAction({ paged: this.data.local.pageMode === 'page', dx: t.clientX - g.x, dy: t.clientY - g.y,
+      atEnd: this.atChapterEnd(el), startedAtEnd: g.atEnd });
+    if (!act) return;
+    if (act === 'nextChapter') { this.autoNextChapter(); return; }
+    this._swipeAt = this.now();                    // 紧跟着那一下 click 是这次滑动带出来的，别再翻一页
+    this.turnPage(act === 'nextPage' ? 1 : -1);
+  }
+  /** 桌面端的同一件事：滚到章末还在继续往下滚，累计够一下就进下一章 */
+  gestureWheel(e) {
+    const el = this.gestureEl(e.target);
+    if (!el || this.data.local.pageMode === 'page' || e.deltaY <= 0 || !this.atChapterEnd(el)) { this._wheelAcc = 0; return; }
+    this._wheelAcc = (this._wheelAcc || 0) + e.deltaY;
+    if (this._wheelAcc < F.SWIPE.wheelEnd) return;
+    this._wheelAcc = 0;
+    this.autoNextChapter();
+  }
+  /**
+   * 翻到下一章。gotoChapter 是异步的（要从 IndexedDB 取正文），所以必须上闸：
+   * 没有这道闸，连着滑两下会一次跨两章，而且第二次拿到的还是旧的 s.reader.chapter。
+   * 最后一章读完之后再推不重复结算。
+   */
+  autoNextChapter() {
+    const r = this.s.reader;
+    if (!r || this._autoCh) return;
+    const b = this.book(r.bookId);
+    if (r.chapter >= b.chapters.length - 1 && b.finishedAt) return;
+    this._autoCh = true;
+    Promise.resolve(this.nextChapter()).finally(() => { this._autoCh = false; });
+  }
   turnPage(dir) {
     const el = this.findReaderEl(); if (!el) return;
     this.measurePages();
     const step = this.pageStep();
     const pg = this.s.rpage + dir;
-    if (pg < 0) return;
-    if (pg >= this.s.pageCount) { this.nextChapter(); return; }
+    // 两头都要能出去（2026-09-16 · 用户验收「左右翻页翻不动」）：以前第一页往回翻直接 return，
+    // 章末往后翻又撞上 nextChapter 的异步竞态，连点两下会跳过一章。现在前后都走 goto/auto 这一条路。
+    if (pg < 0) { this.prevChapter(); return; }
+    if (pg >= this.s.pageCount) { this.autoNextChapter(); return; }
     el.scrollTop = pg * step;
     this.onPageTurn();
     this.onReaderScroll(el);
     this.setState({ rpage: pg });
   }
-  async gotoChapter(i) {
+  /** toEnd：往回翻章时落在上一章的最后一页，而不是又从头开始（翻页模式才有意义） */
+  async gotoChapter(i, toEnd = false) {
     const r = this.s.reader, b = this.book(r.bookId);
     b.pos = { chapter: i, pct: 0 };
     const data = (await this.store.getChapter(b.id, i)) || { title: b.chapters[i].t, text: '', slots: [] };
@@ -957,7 +1038,23 @@ class App {
     this.resetScrollBase();
     this.setState({ reader: { ...r, chapter: i, data }, chapters: false, sheet: null, chPct: 0, rpage: 0 });
     this.save();
-    requestAnimationFrame(() => { if (this.findReaderEl()) { this.readerEl.scrollTop = 0; this.measurePages(); } });
+    requestAnimationFrame(() => {
+      if (!this.findReaderEl()) return;
+      this.readerEl.scrollTop = 0;
+      this.measurePages();
+      if (!toEnd) return;
+      // 落到最后一页要量两次：翻页模式下「下一章」那一行只在最后一页才渲染，它一出现正文就长一截、页数 +1
+      // （实测 9 → 10）。只量一次会停在倒数第二页，用户还得再滑一下才到真正的章末。
+      const fit = () => { if (!this.findReaderEl()) return; this.measurePages(); const last = this.s.pageCount - 1; this.readerEl.scrollTop = last * this.pageStep(); this.setState({ rpage: last }); };
+      fit();
+      requestAnimationFrame(fit);
+    });
+  }
+  /** 第一页再往回翻 = 上一章的最后一页；已经是第一章就不动 */
+  async prevChapter() {
+    const r = this.s.reader;
+    if (!r || r.chapter <= 0) return;
+    await this.gotoChapter(r.chapter - 1, true);
   }
   async nextChapter() {
     const r = this.s.reader, b = this.book(r.bookId);
